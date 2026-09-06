@@ -102,6 +102,18 @@ async function main() {
   const newMerchant = Keypair.generate();
   const provenMerchant = Keypair.generate();
 
+  // register_merchant uses `payer = owner` on-chain, so these freshly
+  // generated merchant keypairs need enough SOL of their own to pay for
+  // their Merchant PDA's rent before we can register them.
+  async function fundNewAccount(pubkey: PublicKey, lamports: number) {
+    const tx = new anchor.web3.Transaction().add(
+      SystemProgram.transfer({ fromPubkey: buyer.publicKey, toPubkey: pubkey, lamports })
+    );
+    await provider.sendAndConfirm(tx, [buyer]);
+  }
+  await fundNewAccount(newMerchant.publicKey, 0.01 * anchor.web3.LAMPORTS_PER_SOL);
+  await fundNewAccount(provenMerchant.publicKey, 0.01 * anchor.web3.LAMPORTS_PER_SOL);
+
   const merchantPda = (owner: PublicKey) =>
     PublicKey.findProgramAddressSync(
       [Buffer.from("merchant"), owner.toBuffer()],

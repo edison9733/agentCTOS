@@ -68,6 +68,15 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
     const owner = Keypair.generate();
     const merchant = merchantPda(owner.publicKey);
 
+    // register_merchant uses `payer = owner` on-chain, so this freshly
+    // generated owner keypair needs its own SOL to pay for the Merchant
+    // PDA's rent before it can sign the registration.
+    const airdropSig = await provider.connection.requestAirdrop(
+      owner.publicKey,
+      LAMPORTS_PER_SOL / 10
+    );
+    await provider.connection.confirmTransaction(airdropSig);
+
     await program.methods
       .registerMerchant()
       .accounts({
