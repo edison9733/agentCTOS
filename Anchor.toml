@@ -5,10 +5,10 @@ anchor_version = "0.29.0"
 seeds = true
 
 [programs.localnet]
-x402_scoring = "11111111111111111111111111111111"
+x402_scoring = "HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4"
 
 [programs.devnet]
-x402_scoring = "11111111111111111111111111111111"
+x402_scoring = "HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4"
 
 [registry]
 url = "https://api.apr.dev"

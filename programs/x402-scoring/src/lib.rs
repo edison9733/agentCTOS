@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("11111111111111111111111111111111");
+declare_id!("HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4");
 
 // ---------------------------------------------------------------------------
 // Agent CTOS Anti-Rug Escrow Program
