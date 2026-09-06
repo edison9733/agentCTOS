@@ -1,0 +1,27 @@
+{
+  "name": "x402-scoring",
+  "version": "0.1.0",
+  "description": "Solana program for x402 scoring system with Low/High merchant tiers",
+  "main": "target/types/x402_scoring.ts",
+  "scripts": {
+    "build": "anchor build",
+    "test": "anchor test",
+    "deploy": "anchor deploy"
+  },
+  "keywords": [
+    "solana",
+    "anchor",
+    "x402",
+    "escrow",
+    "merchant-scoring"
+  ],
+  "author": "Agent CTOS",
+  "license": "MIT",
+  "devDependencies": {
+    "@coral-xyz/anchor": "^0.29",
+    "@solana/web3.js": "^1.91",
+    "@solana/spl-token": "^0.3",
+    "@types/node": "^20",
+    "typescript": "^5"
+  }
+}

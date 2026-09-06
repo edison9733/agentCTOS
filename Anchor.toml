@@ -1,0 +1,17 @@
+[toolchain]
+
+[features]
+seeds = true
+
+[programs.localnet]
+x402_scoring = "11111111111111111111111111111111"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha --timeout 1000000 tests/**/*.ts"

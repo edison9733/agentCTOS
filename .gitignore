@@ -1,0 +1,15 @@
+target/
+.DS_Store
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+.anchor/
