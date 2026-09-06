@@ -205,8 +205,16 @@ pub mod x402_scoring {
         if escrow_amount == 0 {
             // Nothing to hold: the vault we just created is empty, close it
             // immediately so the buyer isn't paying rent for an unused account.
-            let payment_key = ctx.accounts.payment.key();
-            let signer_seeds: &[&[u8]] = &[b"payment", payment_key.as_ref(), &[payment_bump]];
+            let buyer_key = ctx.accounts.buyer.key();
+            let merchant_key = ctx.accounts.merchant.key();
+            let order_id_bytes = order_id.to_le_bytes();
+            let signer_seeds: &[&[u8]] = &[
+                b"payment",
+                buyer_key.as_ref(),
+                merchant_key.as_ref(),
+                &order_id_bytes,
+                &[payment_bump],
+            ];
             token::close_account(CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 CloseAccount {
@@ -262,9 +270,17 @@ pub mod x402_scoring {
 
         let escrow_amount = payment.escrow_amount;
         let order_amount = payment.amount;
-        let payment_key = ctx.accounts.payment.key();
-        let payment_bump = ctx.accounts.payment.bump;
-        let signer_seeds: &[&[u8]] = &[b"payment", payment_key.as_ref(), &[payment_bump]];
+        let payment_buyer = payment.buyer;
+        let payment_merchant = payment.merchant;
+        let payment_bump = payment.bump;
+        let order_id_bytes = order_id.to_le_bytes();
+        let signer_seeds: &[&[u8]] = &[
+            b"payment",
+            payment_buyer.as_ref(),
+            payment_merchant.as_ref(),
+            &order_id_bytes,
+            &[payment_bump],
+        ];
 
         if escrow_amount > 0 {
             token::transfer(
@@ -312,9 +328,17 @@ pub mod x402_scoring {
         require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
 
         let escrow_amount = payment.escrow_amount;
-        let payment_key = ctx.accounts.payment.key();
-        let payment_bump = ctx.accounts.payment.bump;
-        let signer_seeds: &[&[u8]] = &[b"payment", payment_key.as_ref(), &[payment_bump]];
+        let payment_buyer = payment.buyer;
+        let payment_merchant = payment.merchant;
+        let payment_bump = payment.bump;
+        let order_id_bytes = order_id.to_le_bytes();
+        let signer_seeds: &[&[u8]] = &[
+            b"payment",
+            payment_buyer.as_ref(),
+            payment_merchant.as_ref(),
+            &order_id_bytes,
+            &[payment_bump],
+        ];
 
         if escrow_amount > 0 {
             token::transfer(
@@ -374,9 +398,17 @@ pub mod x402_scoring {
         );
 
         let escrow_amount = payment.escrow_amount;
-        let payment_key = ctx.accounts.payment.key();
-        let payment_bump = ctx.accounts.payment.bump;
-        let signer_seeds: &[&[u8]] = &[b"payment", payment_key.as_ref(), &[payment_bump]];
+        let payment_buyer = payment.buyer;
+        let payment_merchant = payment.merchant;
+        let payment_bump = payment.bump;
+        let order_id_bytes = order_id.to_le_bytes();
+        let signer_seeds: &[&[u8]] = &[
+            b"payment",
+            payment_buyer.as_ref(),
+            payment_merchant.as_ref(),
+            &order_id_bytes,
+            &[payment_bump],
+        ];
 
         if escrow_amount > 0 {
             token::transfer(
