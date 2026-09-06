@@ -458,7 +458,11 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
 
     const paymentData = await program.account.payment.fetch(payment);
     assert.deepEqual(paymentData.status, { reclaimed: {} });
-  }).timeout(70_000);
+    // The 62s sleep above is only part of this test's runtime: building the
+    // tier-2 history first costs another ~15s of validator round-trips, so the
+    // budget has to cover both. MIN_TIMEOUT_SECONDS is 60 on-chain, so the
+    // sleep itself cannot be shortened without weakening what this asserts.
+  }).timeout(150_000);
 
   it("Rule 5: a buyer-initiated refund raises the refund rate for future tier math", async () => {
     const { merchant, token } = await registerMerchant();
