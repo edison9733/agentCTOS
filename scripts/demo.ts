@@ -111,7 +111,7 @@ async function main() {
 
   const links: string[] = [];
   const record = (label: string, sig: string) => {
-    links.push(`   ${label.padEnd(34)} ${explorerTx(sig, rpcUrl)}`);
+    links.push(`   ${label.padEnd(40)} ${explorerTx(sig, rpcUrl)}`);
   };
 
   console.log("=".repeat(72));
@@ -313,9 +313,29 @@ async function main() {
     { label: "Nova  tier 2 500.000", merchant: novaPda, token: novaToken, amount: unit(500), id: new BN(32) },
   ];
 
+  // Column widths are shared by the header, the rule, and every row so the
+  // table stays aligned when an escrow cell runs long (e.g. "500.000 (100.0%)").
+  const COL = { label: 21, escrow: 16, instant: 8, forced: 7, rule: 21 };
+  const GAP = "  ";
+  const row = (a: string, b: string, c: string, d: string, e: string) =>
+    "     " +
+    a.padEnd(COL.label) + GAP +
+    b.padEnd(COL.escrow) + GAP +
+    c.padEnd(COL.instant) + GAP +
+    d.padEnd(COL.forced) + GAP +
+    e;
+
   console.log("");
-  console.log("     payment                escrow      instant   forced   reserve rule");
-  console.log("     ─────────────────────  ──────────  ────────  ───────  ─────────────────────────");
+  console.log(row("payment", "escrow", "instant", "forced", "reserve rule"));
+  console.log(
+    row(
+      "─".repeat(COL.label),
+      "─".repeat(COL.escrow),
+      "─".repeat(COL.instant),
+      "─".repeat(COL.forced),
+      "─".repeat(COL.rule)
+    )
+  );
 
   for (const c of cases) {
     const payment = paymentPda(c.merchant, c.id);
@@ -346,8 +366,13 @@ async function main() {
         ? "tier 1 → 100%"
         : "tier 2 → 10% + base";
     console.log(
-      `     ${c.label.padEnd(21)}  ${(fmt(p.escrowAmount) + ` (${pct}%)`).padEnd(10)}  ` +
-        `${fmt(p.instantAmount).padEnd(8)}  ${String(p.forcedFullEscrow).padEnd(7)}  ${rule}`
+      row(
+        c.label,
+        `${fmt(p.escrowAmount)} (${pct}%)`,
+        fmt(p.instantAmount),
+        String(p.forcedFullEscrow),
+        rule
+      )
     );
   }
 
