@@ -90,6 +90,7 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
       .accounts({
         merchant,
         owner: owner.publicKey,
+        mint,
         systemProgram: SystemProgram.programId,
       })
       .signers([owner])
@@ -169,6 +170,78 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
     );
     return buyerToken;
   }
+
+  it("reputation is denominated: a payment in a foreign mint is rejected", async () => {
+    // avg_tx_size is a bare u64. Without a mint pinned to the merchant, a
+    // payment in a second token would be summed into the same running average
+    // as the first, letting a merchant inflate its size baseline (and so the
+    // anomaly ceiling that prices every future payment) with a worthless mint.
+    const { merchant, token } = await registerMerchant();
+
+    const foreignMint = await createMint(
+      provider.connection,
+      payerWallet,
+      provider.wallet.publicKey,
+      null,
+      DECIMALS
+    );
+    const foreignBuyerToken = await createAccount(
+      provider.connection,
+      payerWallet,
+      foreignMint,
+      buyer.publicKey
+    );
+    await mintTo(
+      provider.connection,
+      payerWallet,
+      foreignMint,
+      foreignBuyerToken,
+      provider.wallet.publicKey,
+      BigInt(unit(1_000_000).toString())
+    );
+    const foreignMerchantToken = await createAccount(
+      provider.connection,
+      payerWallet,
+      foreignMint,
+      (await program.account.merchant.fetch(merchant)).address
+    );
+
+    const orderId = new BN(900);
+    const payment = paymentPda(merchant, orderId);
+
+    try {
+      await program.methods
+        .initiatePayment(unit(1_000_000), orderId, new BN(3600))
+        .accounts({
+          payment,
+          merchant,
+          buyer: buyer.publicKey,
+          buyerToken: foreignBuyerToken,
+          merchantToken: foreignMerchantToken,
+          escrowVault: vaultPda(payment),
+          mint: foreignMint,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY,
+        })
+        .signers([buyer])
+        .rpc();
+      assert.fail("expected the foreign-mint payment to be rejected");
+    } catch (err) {
+      assert.ok(
+        String(err).includes("MintMismatch"),
+        `expected MintMismatch, got: ${err}`
+      );
+    }
+
+    // The merchant's history is untouched by the rejected attempt.
+    const data = await program.account.merchant.fetch(merchant);
+    assert.equal(data.avgTxSize.toNumber(), 0);
+    assert.equal(data.completedTxCount.toNumber(), 0);
+    assert.equal(data.mint.toBase58(), mint.toBase58());
+    // `token` is the merchant's account in the registered mint, unaffected.
+    assert.ok(token);
+  });
 
   it("Rule 4: a brand-new merchant starts at tier 1 with zero history", async () => {
     const { merchant } = await registerMerchant();

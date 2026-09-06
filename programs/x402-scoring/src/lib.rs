@@ -97,6 +97,7 @@ pub mod x402_scoring {
     pub fn register_merchant(ctx: Context<RegisterMerchant>) -> Result<()> {
         let merchant = &mut ctx.accounts.merchant;
         merchant.address = ctx.accounts.owner.key();
+        merchant.mint = ctx.accounts.mint.key();
         merchant.tier = 1;
         merchant.completed_tx_count = 0;
         merchant.total_completed_volume = 0;
@@ -125,13 +126,22 @@ pub mod x402_scoring {
         );
 
         let merchant = &mut ctx.accounts.merchant;
+
+        // Rule 8: tier is a pure function of the merchant's counters, so derive
+        // it here rather than pricing against a possibly stale stored value.
+        // This is the same function `recompute_tier` exposes permissionlessly —
+        // a merchant whose refund/reclaim rates have gone bad lands on the exact
+        // tier it would land on there, no matter which instruction ran first.
+        merchant.recompute_tier();
+
         let is_new = merchant.completed_tx_count == 0;
 
         let mut forced_full_escrow = false;
         let escrow_amount: u64;
 
         if is_new || merchant.tier == 1 {
-            // Rule 4: new / tier-1 merchants are 100% escrowed, no exceptions.
+            // Rule 4/5/6: new merchants, and any merchant demoted to tier 1 by
+            // its settlement history, are 100% escrowed with no exceptions.
             escrow_amount = amount;
         } else {
             // Rule 2/3/10: size & velocity check against the merchant's own history.
@@ -145,23 +155,8 @@ pub mod x402_scoring {
                 escrow_amount = amount;
                 forced_full_escrow = true;
             } else {
-                let (refund_bps, reclaim_bps) = merchant.rates_bps();
-                if refund_bps > REFUND_RATE_THRESHOLD_BPS
-                    || reclaim_bps > RECLAIM_RATE_THRESHOLD_BPS
-                {
-                    // Rule 5/6: bad settlement history demotes the tier, then
-                    // the reserve is recalculated under the lower tier.
-                    let demoted = merchant.tier.saturating_sub(1).max(1);
-                    merchant.tier = demoted;
-                    escrow_amount = if demoted == 1 {
-                        amount
-                    } else {
-                        reserve_amount(amount, demoted)?
-                    };
-                } else {
-                    // Rule 1/9: minimal, size-scaled collateral for a proven merchant.
-                    escrow_amount = reserve_amount(amount, merchant.tier)?;
-                }
+                // Rule 1/9: minimal, size-scaled collateral for a proven merchant.
+                escrow_amount = reserve_amount(amount, merchant.tier)?;
             }
         }
 
@@ -237,6 +232,7 @@ pub mod x402_scoring {
         let payment = &mut ctx.accounts.payment;
         payment.buyer = ctx.accounts.buyer.key();
         payment.merchant = ctx.accounts.merchant.key();
+        payment.mint = ctx.accounts.mint.key();
         payment.order_id = order_id;
         payment.amount = amount;
         payment.escrow_amount = escrow_amount;
@@ -473,6 +469,11 @@ pub mod x402_scoring {
 #[derive(InitSpace)]
 pub struct Merchant {
     pub address: Pubkey,
+    /// The single SPL mint this merchant settles in, fixed at registration.
+    /// Reputation is denominated: `avg_tx_size` and `total_completed_volume`
+    /// are only meaningful if every payment counted into them is in the same
+    /// unit, so payments in any other mint are rejected outright.
+    pub mint: Pubkey,
     /// 1 = new/unproven, 2 = proven, 3 = trusted, 4 = excellent.
     pub tier: u8,
     /// Only settled/confirmed transactions count here (rule 7).
@@ -558,6 +559,9 @@ impl Merchant {
 pub struct Payment {
     pub buyer: Pubkey,
     pub merchant: Pubkey,
+    /// Settlement mint, snapshotted so an audit of this payment never has to
+    /// trust the merchant account's current state.
+    pub mint: Pubkey,
     pub order_id: u64,
     pub amount: u64,
     /// Portion of `amount` held in the escrow vault (rule 1/9).
@@ -598,6 +602,8 @@ pub struct RegisterMerchant<'info> {
     pub merchant: Account<'info, Merchant>,
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// The mint this merchant will settle in for the life of the account.
+    pub mint: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
 }
 
@@ -617,6 +623,10 @@ pub struct InitiatePayment<'info> {
         mut,
         seeds = [b"merchant", merchant.address.as_ref()],
         bump = merchant.bump,
+        // Reputation is denominated: a payment in any mint other than the one
+        // the merchant registered would corrupt avg_tx_size, and with it the
+        // size-anomaly check that prices every future payment.
+        constraint = merchant.mint == mint.key() @ ErrorCode::MintMismatch,
     )]
     pub merchant: Account<'info, Merchant>,
 
@@ -788,6 +798,8 @@ pub enum ErrorCode {
     InvalidTokenOwner,
     #[msg("Token account mint does not match the expected mint")]
     InvalidMint,
+    #[msg("Payment mint does not match the merchant's registered settlement mint")]
+    MintMismatch,
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
     #[msg("Arithmetic underflow")]

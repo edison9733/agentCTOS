@@ -214,7 +214,12 @@ async function main() {
   ] as [string, Keypair, PublicKey][]) {
     const sig = await program.methods
       .registerMerchant()
-      .accounts({ merchant: pda, owner: owner.publicKey, systemProgram: SystemProgram.programId })
+      .accounts({
+        merchant: pda,
+        owner: owner.publicKey,
+        mint,
+        systemProgram: SystemProgram.programId,
+      })
       .signers([owner])
       .rpc();
     record(`register_merchant(${name})`, sig);
