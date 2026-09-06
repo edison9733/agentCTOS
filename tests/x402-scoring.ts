@@ -154,11 +154,18 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
   });
 
   async function fundBuyerToken(amount: BN): Promise<PublicKey> {
+    // Every test calls this against the same (mint, buyer) pair. Without an
+    // explicit keypair, createAccount derives the *associated* token account,
+    // which can only be created once — every test after the first would fail
+    // with "Provided owner is not allowed" (the ATA program rejecting a Create
+    // on an already-initialized account). A fresh keypair gives each test its
+    // own funded token account instead.
     const buyerToken = await createAccount(
       provider.connection,
       payerWallet,
       mint,
-      buyer.publicKey
+      buyer.publicKey,
+      Keypair.generate()
     );
     await mintTo(
       provider.connection,

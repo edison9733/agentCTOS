@@ -599,11 +599,11 @@ pub struct RegisterMerchant<'info> {
         seeds = [b"merchant", owner.key().as_ref()],
         bump
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
     #[account(mut)]
     pub owner: Signer<'info>,
     /// The mint this merchant will settle in for the life of the account.
-    pub mint: Account<'info, Mint>,
+    pub mint: Box<Account<'info, Mint>>,
     pub system_program: Program<'info, System>,
 }
 
@@ -617,7 +617,7 @@ pub struct InitiatePayment<'info> {
         seeds = [b"payment", buyer.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
         bump
     )]
-    pub payment: Account<'info, Payment>,
+    pub payment: Box<Account<'info, Payment>>,
 
     #[account(
         mut,
@@ -628,7 +628,7 @@ pub struct InitiatePayment<'info> {
         // size-anomaly check that prices every future payment.
         constraint = merchant.mint == mint.key() @ ErrorCode::MintMismatch,
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
@@ -638,14 +638,14 @@ pub struct InitiatePayment<'info> {
         constraint = buyer_token.owner == buyer.key() @ ErrorCode::InvalidTokenOwner,
         constraint = buyer_token.mint == mint.key() @ ErrorCode::InvalidMint,
     )]
-    pub buyer_token: Account<'info, TokenAccount>,
+    pub buyer_token: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = merchant_token.owner == merchant.address @ ErrorCode::InvalidTokenOwner,
         constraint = merchant_token.mint == mint.key() @ ErrorCode::InvalidMint,
     )]
-    pub merchant_token: Account<'info, TokenAccount>,
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
 
     #[account(
         init,
@@ -655,9 +655,9 @@ pub struct InitiatePayment<'info> {
         token::mint = mint,
         token::authority = payment,
     )]
-    pub escrow_vault: Account<'info, TokenAccount>,
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
 
-    pub mint: Account<'info, Mint>,
+    pub mint: Box<Account<'info, Mint>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -672,14 +672,14 @@ pub struct ConfirmDelivery<'info> {
         seeds = [b"payment", buyer.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
         bump = payment.bump,
     )]
-    pub payment: Account<'info, Payment>,
+    pub payment: Box<Account<'info, Payment>>,
 
     #[account(
         mut,
         seeds = [b"merchant", merchant.address.as_ref()],
         bump = merchant.bump,
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
@@ -689,13 +689,13 @@ pub struct ConfirmDelivery<'info> {
         seeds = [b"vault", payment.key().as_ref()],
         bump = payment.vault_bump,
     )]
-    pub escrow_vault: Account<'info, TokenAccount>,
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = merchant_token.owner == merchant.address @ ErrorCode::InvalidTokenOwner,
     )]
-    pub merchant_token: Account<'info, TokenAccount>,
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -708,14 +708,14 @@ pub struct RefundEscrow<'info> {
         seeds = [b"payment", buyer.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
         bump = payment.bump,
     )]
-    pub payment: Account<'info, Payment>,
+    pub payment: Box<Account<'info, Payment>>,
 
     #[account(
         mut,
         seeds = [b"merchant", merchant.address.as_ref()],
         bump = merchant.bump,
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
@@ -725,13 +725,13 @@ pub struct RefundEscrow<'info> {
         seeds = [b"vault", payment.key().as_ref()],
         bump = payment.vault_bump,
     )]
-    pub escrow_vault: Account<'info, TokenAccount>,
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = buyer_token.owner == buyer.key() @ ErrorCode::InvalidTokenOwner,
     )]
-    pub buyer_token: Account<'info, TokenAccount>,
+    pub buyer_token: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -744,14 +744,14 @@ pub struct ReclaimTimeout<'info> {
         seeds = [b"payment", buyer.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
         bump = payment.bump,
     )]
-    pub payment: Account<'info, Payment>,
+    pub payment: Box<Account<'info, Payment>>,
 
     #[account(
         mut,
         seeds = [b"merchant", merchant.address.as_ref()],
         bump = merchant.bump,
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
 
     #[account(mut)]
     pub buyer: Signer<'info>,
@@ -761,13 +761,13 @@ pub struct ReclaimTimeout<'info> {
         seeds = [b"vault", payment.key().as_ref()],
         bump = payment.vault_bump,
     )]
-    pub escrow_vault: Account<'info, TokenAccount>,
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = buyer_token.owner == buyer.key() @ ErrorCode::InvalidTokenOwner,
     )]
-    pub buyer_token: Account<'info, TokenAccount>,
+    pub buyer_token: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -779,7 +779,7 @@ pub struct RecomputeTier<'info> {
         seeds = [b"merchant", merchant.address.as_ref()],
         bump = merchant.bump,
     )]
-    pub merchant: Account<'info, Merchant>,
+    pub merchant: Box<Account<'info, Merchant>>,
 }
 
 #[error_code]
