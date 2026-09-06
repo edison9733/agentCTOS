@@ -140,6 +140,36 @@ solana airdrop 2
 anchor deploy
 ```
 
+## Live Demo
+
+`scripts/demo.ts` runs an end-to-end walkthrough against a real cluster: it
+registers a brand-new merchant and a "proven" one (seeded with five clean
+orders so it mechanically promotes to tier 2), then fires off real
+transactions that show the decision tree making a different call each time —
+full escrow for the new merchant, a small scaled reserve for the proven one,
+a forced full escrow when a payment blows past that merchant's own history,
+and a buyer-initiated refund. It mints its own demo SPL token and uses your
+already-funded CLI wallet as the buyer, so it has no faucet dependency.
+
+```bash
+anchor build       # once, so target/idl + target/types exist
+npm run demo       # defaults to devnet, using ~/.config/solana/id.json
+```
+
+Every step prints the transaction signature plus a clickable
+`explorer.solana.com` link, and re-fetches the `Merchant`/`Payment` PDA state
+right after so what's on screen is exactly what's on-chain — nothing here is
+computed off-chain.
+
+To rehearse the same demo locally first (faster, no devnet RPC/confirmation
+delays):
+
+```bash
+solana-test-validator                                  # in one terminal
+anchor deploy --provider.cluster localnet               # in another terminal
+ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 npm run demo
+```
+
 ## Prerequisites
 
 1. Node.js 18+ and a package manager (npm/pnpm/yarn)

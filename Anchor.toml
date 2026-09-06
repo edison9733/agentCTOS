@@ -6,6 +6,9 @@ seeds = true
 [programs.localnet]
 x402_scoring = "11111111111111111111111111111111"
 
+[programs.devnet]
+x402_scoring = "11111111111111111111111111111111"
+
 [registry]
 url = "https://api.apr.dev"
 
@@ -14,4 +17,5 @@ cluster = "Localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha --timeout 1000000 tests/**/*.ts"
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+demo = "npx ts-node scripts/demo.ts"

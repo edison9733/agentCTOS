@@ -21,6 +21,7 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
   const program = anchor.workspace.X402Scoring as Program<X402Scoring>;
+  const payerWallet = (provider.wallet as anchor.Wallet).payer;
 
   let mint: PublicKey;
   const DECIMALS = 6;
@@ -67,7 +68,7 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
 
     const token = await createAccount(
       provider.connection,
-      provider.wallet.payer,
+      payerWallet,
       mint,
       owner.publicKey
     );
@@ -115,7 +116,7 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
 
     mint = await createMint(
       provider.connection,
-      provider.wallet.payer,
+      payerWallet,
       provider.wallet.publicKey,
       null,
       DECIMALS
@@ -125,13 +126,13 @@ describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
   async function fundBuyerToken(amount: BN): Promise<PublicKey> {
     const buyerToken = await createAccount(
       provider.connection,
-      provider.wallet.payer,
+      payerWallet,
       mint,
       buyer.publicKey
     );
     await mintTo(
       provider.connection,
-      provider.wallet.payer,
+      payerWallet,
       mint,
       buyerToken,
       provider.wallet.publicKey,
