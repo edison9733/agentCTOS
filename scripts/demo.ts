@@ -46,14 +46,18 @@ import { X402Scoring } from "../target/types/x402_scoring";
 // anchor.workspace.X402Scoring mis-derives the IDL filename for program
 // names containing digits (it produces `x_402_scoring.json` instead of the
 // real `x402_scoring.json`), so the IDL is loaded directly instead.
+//
+// The program id is read straight from the deploy keypair rather than from
+// idl.metadata.address / idl.address: whether either field is even present
+// varies across anchor-cli builds (some 0.29.0 builds emit neither), while
+// the keypair is always there after `anchor build` and is unambiguously the
+// program's real on-chain address.
 function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
   const idlPath = path.join(__dirname, "..", "target", "idl", "x402_scoring.json");
   const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
-  // Anchor 0.30+'s CLI puts the address at the top level (`idl.address`)
-  // instead of the 0.29-era `idl.metadata.address` — support either, since
-  // the installed `anchor` CLI binary can be newer than the pinned
-  // @coral-xyz/anchor npm package that actually loads this IDL.
-  const programId = new PublicKey(idl.address ?? idl.metadata.address);
+  const keypairPath = path.join(__dirname, "..", "target", "deploy", "x402_scoring-keypair.json");
+  const secretKey = Uint8Array.from(JSON.parse(fs.readFileSync(keypairPath, "utf8")));
+  const programId = Keypair.fromSecretKey(secretKey).publicKey;
   return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
 }
 
