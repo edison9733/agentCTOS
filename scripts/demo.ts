@@ -39,7 +39,19 @@ import {
   createAccount,
   mintTo,
 } from "@solana/spl-token";
+import * as fs from "fs";
+import * as path from "path";
 import { X402Scoring } from "../target/types/x402_scoring";
+
+// anchor.workspace.X402Scoring mis-derives the IDL filename for program
+// names containing digits (it produces `x_402_scoring.json` instead of the
+// real `x402_scoring.json`), so the IDL is loaded directly instead.
+function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
+  const idlPath = path.join(__dirname, "..", "target", "idl", "x402_scoring.json");
+  const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
+  const programId = new PublicKey(idl.metadata.address);
+  return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
+}
 
 const DECIMALS = 6;
 const unit = (n: number) => new BN(Math.round(n * 10 ** DECIMALS));
@@ -72,7 +84,7 @@ function explorerAddressLink(addr: PublicKey, rpcUrl: string): string {
 async function main() {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  const program = anchor.workspace.X402Scoring as Program<X402Scoring>;
+  const program = loadProgram(provider);
   const rpcUrl = provider.connection.rpcEndpoint;
 
   console.log("=================================================================");

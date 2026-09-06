@@ -16,11 +16,23 @@ import {
   getAccount,
 } from "@solana/spl-token";
 import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
+
+// anchor.workspace.X402Scoring mis-derives the IDL filename for program
+// names containing digits (it produces `x_402_scoring.json` instead of the
+// real `x402_scoring.json`), so the IDL is loaded directly instead.
+function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
+  const idlPath = path.join(__dirname, "..", "target", "idl", "x402_scoring.json");
+  const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
+  const programId = new PublicKey(idl.metadata.address);
+  return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
+}
 
 describe("x402-scoring (Agent CTOS anti-rug escrow)", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  const program = anchor.workspace.X402Scoring as Program<X402Scoring>;
+  const program = loadProgram(provider);
   const payerWallet = (provider.wallet as anchor.Wallet).payer;
 
   let mint: PublicKey;
