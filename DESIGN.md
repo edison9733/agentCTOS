@@ -1,241 +1,212 @@
-# x402 Solana Scoring System - Design Document
+# Agent CTOS Anti-Rug Escrow — Design Document
 
 ## Problem Statement
 
-x402 is a payment protocol that treats all merchants the same way, regardless of trustworthiness. This creates several security issues:
+x402's `exact` scheme on Solana is a single irreversible transfer: the buyer
+signs, the facilitator submits, and the money is gone the instant the
+transaction lands. There is no native escrow or commerce scheme for Solana in
+the x402 spec (unlike EVM, which has the audited Commerce Payments
+Protocol). That means:
 
-1. **No Risk Differentiation**: Risky and unknown merchants get the same payment terms as trusted ones
-2. **Zero Buyer Protection**: If a merchant takes payment and never delivers, the buyer has no recourse
-3. **No Transparency**: There's no built-in way to distinguish "safe merchants" from "risky merchants" before making a payment
+1. **No risk differentiation** — a brand-new, unproven merchant is paid
+   exactly as fast and exactly as irreversibly as one with years of clean
+   settlement history.
+2. **Zero buyer protection** — if a merchant takes payment and never
+   delivers, the buyer has no recourse; the transfer already finalized.
+3. **No transparency** — nothing about a merchant's track record is visible
+   on-chain before a buyer pays them.
 
 ## Solution Overview
 
-The x402 Solana Scoring System implements a **two-tier trust model** that allows merchants to be categorized as either Low or High tier. Payment settlement is automatically adjusted based on tier:
+A facilitator can sit as the `feePayer`/sponsor in x402's `exact` SVM flow
+and, per the spec's own Sponsor Acceptance Policy, refuse or reroute a
+payment before signing it. This program is what that facilitator routes
+into: a merchant-underwriting escrow where trust is **collateral, not
+reputation** — a merchant's tier only ever grants *speed*, never an
+exemption from having the appropriate reserve actually funded.
 
-- **Low-tier merchants**: Use escrow protection (funds held until delivery confirmed)
-- **High-tier merchants**: Get instant payment (no delay, reflects their proven track record)
+Every input to the tier is a settlement event that already happened
+on-chain (a confirmed delivery, a refund, a reclaim). There is no
+`update_merchant_tier` instruction, no admin key, no discretionary override
+anywhere in this program — tier is a pure function of history, recomputed
+the same way every time, by anyone.
+
+## The Twelve Anti-Rug Rules
+
+| # | Rule | Enforced in |
+|---|---|---|
+| 1 | Reserve scales with tx size: `base_reserve + tx_size × risk_multiplier` | `reserve_amount()` |
+| 2 | Size multiplier by tier (2x / 10x / 50x / 100x) | `TIER_MULTIPLIER`, `tier_multiplier()` |
+| 3 | No N-x jumps — oversized tx forced to full escrow | `initiate_payment` size-anomaly branch |
+| 4 | New addresses = zero trust | `initiate_payment` `is_new \|\| tier == 1` branch |
+| 5 | Refund rate signal | `Merchant::rates_bps()`, `refund_escrow` |
+| 6 | Reclaim rate signal | `Merchant::rates_bps()`, `reclaim_timeout` |
+| 7 | Completed volume is input, pending/disputed isn't | `Merchant::record_completed()` |
+| 8 | No human opinion — pure recompute | `Merchant::recompute_tier()` |
+| 9 | Trust ≤ collateral | atomic transfer in `initiate_payment` |
+| 10 | Velocity check | same avg-relative check as rules 2/3 |
+| 11 | Reserve survives tier changes | `Payment.escrow_amount` is immutable post-creation |
+| 12 | Cold-start cost after a rug | `reclaim_timeout` resets tier + sets `tier_floor_tx_count` |
 
 ## Core Concepts
 
-### 1. Merchant Tiers
+### Merchant Tiers
 
-#### Low Tier (Default)
-- New merchants start at Low tier
-- Payments are held in escrow
-- Merchant only receives funds after buyer confirms delivery
-- Protects buyers from non-delivery risk
-- Incentivizes merchants to deliver on promises
+Tiers are integers 1–4, not labels — a plain `u8` the program itself assigns
+via `recompute_tier`, which nobody can call with a different outcome than
+the one the counters dictate.
 
-#### High Tier
-- Earned through successful deliveries
-- Payments settle instantly (no escrow)
-- Reflects merchant's proven reliability
-- Better customer experience for both buyer and merchant
+| Tier | Meaning | Size multiplier | Reserve (risk_multiplier) |
+|---|---|---|---|
+| 1 | New / unproven | 2x avg | 100% (full escrow, no exception) |
+| 2 | Proven | 10x avg | 10% |
+| 3 | Trusted | 50x avg | 3% |
+| 4 | Excellent | 100x avg | 1% |
 
-### 2. Payment Flow by Tier
+Promotion thresholds (all must hold, purely mechanical):
 
-#### Low-Tier Payment Flow
 ```
-Buyer initiates payment
-    ↓
-Funds → Escrow Account
-    ↓
-Buyer receives goods/services
-    ↓
-Buyer confirms delivery
-    ↓
-Funds released from Escrow → Merchant
-    ↓
-Transaction complete
+tier 4  <- completed_tx_count >= 50  AND refund_rate <= 5%  AND reclaim_rate <= 3%
+tier 3  <- completed_tx_count >= 20  AND refund_rate <= 5%  AND reclaim_rate <= 3%
+tier 2  <- completed_tx_count >= 5   AND refund_rate <= 5%  AND reclaim_rate <= 3%
+tier 1  <- otherwise
 ```
 
-#### High-Tier Payment Flow
+A merchant can never be promoted past tier 1 while
+`completed_tx_count < tier_floor_tx_count` — the cold-start floor set after a
+reclaim (rule 12).
+
+### The `/verify`-Time Decision Tree
+
 ```
-Buyer initiates payment
-    ↓
-Funds → Merchant Account (immediately)
-    ↓
-Transaction complete
-```
+if merchant_is_new OR merchant_tier == 1:
+    -> 100% escrow for all transactions
 
-### 3. Data Structures
+else if tx_size > avg_historical_size × tier_multiplier:
+    -> force escrow for the entire amount (this tx only — tier is untouched)
 
-#### Merchant Account
-Stores persistent merchant information:
-- `address`: Merchant's public key
-- `tier`: Current trust tier (Low/High)
-- `total_payments`: Cumulative payment count (for metrics)
-- `successful_deliveries`: Count of confirmed escrow releases
-- `escrow_balance`: Total funds currently held in escrow
+else if refund_rate > threshold OR reclaim_rate > threshold:
+    -> lower tier, recalculate the reserve under the new tier
 
-#### Payment Account
-Tracks individual transaction state:
-- `buyer`: Buyer's public key
-- `merchant`: Merchant's public key
-- `amount`: Payment amount
-- `order_id`: Unique order identifier
-- `status`: Current payment status (Pending → EscrowHeld/Settled/Refunded)
-- `created_at`: Unix timestamp
-
-### 4. Payment Statuses
-
-- **Pending**: Payment initialized but not yet processed
-- **EscrowHeld**: Funds in escrow (Low-tier merchants only)
-- **Settled**: Payment completed and delivered to recipient
-- **Refunded**: Payment returned to buyer
-
-## Key Operations
-
-### Register Merchant
-Creates a new merchant account with Low tier status.
-
-**Requirements:**
-- Merchant signs the transaction
-- Creates a PDA: `[b"merchant", merchant_pubkey]`
-
-**State Changes:**
-- New Merchant account created
-- Tier set to Low
-- Counters initialized to 0
-
-### Update Merchant Tier
-Changes a merchant's trust tier.
-
-**Requirements:**
-- Only the merchant themselves can update their tier
-- Tier must be valid (0=Low, 1=High)
-
-**Use Cases:**
-- Promotion: Low → High after successful deliveries
-- Demotion: High → Low after failed transactions (if implemented)
-
-### Initiate Payment
-Routes payment to either escrow or direct delivery based on merchant tier.
-
-**Requirements:**
-- Buyer signs the transaction
-- Sufficient balance in buyer's token account
-- Target merchant account exists
-
-**Logic:**
-```
-if merchant.tier == Low:
-    transfer(buyer_token → escrow_token)
-    payment.status = EscrowHeld
-else if merchant.tier == High:
-    transfer(buyer_token → merchant_token)
-    payment.status = Settled
+else:
+    -> instant settlement, minimal reserve per tier
 ```
 
-### Confirm Delivery
-Releases escrowed funds to merchant (Low-tier only).
+This tree runs once, atomically, inside `initiate_payment`. The buyer's
+tokens are split in the same instruction: the escrow slice moves to the
+vault PDA, the instant slice moves straight to the merchant. A merchant
+cannot receive the instant portion without the buyer's escrow slice also
+landing — there is no code path where one succeeds without the other.
 
-**Requirements:**
-- Buyer signs the transaction (only buyer can confirm)
-- Payment status must be EscrowHeld
-- Escrow authority signs to release funds
-- Correct order_id provided
+### Payment Lifecycle
 
-**State Changes:**
-- Funds transferred from escrow to merchant
-- Payment status → Settled
-- Merchant's successful_deliveries incremented
-- Merchant's total_payments incremented
-- Escrow balance decremented
+```
+initiate_payment
+    |
+    v
+escrow_amount == 0 ? --yes--> Settled (counted toward history immediately)
+    |
+    no
+    v
+EscrowHeld -----confirm_delivery-----> Settled (counted toward history)
+    |
+    |-----refund_escrow----------------> Refunded (raises refund rate)
+    |
+    '-----reclaim_timeout (post-expiry)-> Reclaimed (raises reclaim rate,
+                                            resets tier to 1, rule 12)
+```
 
-### Refund Escrow
-Returns escrowed payment to buyer (Low-tier only).
-
-**Requirements:**
-- Buyer signs the transaction
-- Payment status must be EscrowHeld
-- Correct order_id provided
-
-**Use Cases:**
-- Buyer determined merchant didn't deliver
-- Mutual agreement to cancel transaction
-
-**State Changes:**
-- Funds transferred from escrow to buyer
-- Payment status → Refunded
-- Merchant's escrow balance decremented
+Only the `Settled` path (whether instant or via `confirm_delivery`) ever
+feeds `avg_tx_size` / `total_completed_volume` / `completed_tx_count` — a
+refunded or reclaimed order changes the *rate* denominators but never counts
+as completed volume (rule 7).
 
 ## Security Model
 
-### Access Control
-- **Merchant tier update**: Only merchant themselves (signer)
-- **Payment confirmation**: Only payment buyer (signer)
-- **Escrow authority**: Required to release funds (multi-sig safety)
+### Fund custody
+The escrow vault's authority is the `Payment` PDA itself, not a human-held
+"escrow authority" keypair. Every release (`confirm_delivery`), refund
+(`refund_escrow`), and reclaim (`reclaim_timeout`) signs its CPI with the
+`Payment` account's own derivation seeds. There is no key whose compromise
+lets anyone but the buyer (via reclaim) or the program logic (via confirm)
+move escrowed funds.
 
-### Fund Safety
-- **Escrow separation**: Low-tier funds never go to merchant until confirmed
-- **Atomic transfers**: Each payment state change is atomic
-- **Overflow protection**: All arithmetic checked for overflow/underflow
+### Access control
+- `confirm_delivery` / `refund_escrow` / `reclaim_timeout`: buyer-signed only.
+- `reclaim_timeout`: additionally gated on `now > payment.expiry`.
+- `recompute_tier`: permissionless by design — since it is a pure function
+  of on-chain state, there is nothing to gate; letting anyone call it makes
+  independent verification trivial.
+- There is no instruction that lets a merchant, an operator, or anyone else
+  set a tier directly.
 
-### Merchant Accountability
-- **Successful delivery tracking**: Enables tier promotion decisions
-- **Historical record**: All metrics stored on-chain permanently
-- **Tier-based consequences**: High-tier merchants risk demotion if delivery fails
+### Arithmetic safety
+Every counter update uses `checked_add`/`checked_mul`/`checked_sub`/`checked_div`;
+the running average (`avg_tx_size`) is computed in `u128` to avoid overflow
+before narrowing back to `u64`.
+
+### Reserve immutability (rule 11)
+`Payment.escrow_amount` and `Payment.expiry` are set once, at creation, from
+the merchant's tier *at that moment* (`tier_at_payment` is stored purely for
+audit). If the merchant's tier changes afterward — promoted, demoted, or
+reset to 1 by a later reclaim — no already-open escrow's terms move. The
+reclaim timeout on an open escrow always applies regardless of what happens
+to the merchant's tier in the meantime.
 
 ## Incentive Alignment
 
-### For Merchants
-- **Low tier**: Temporary friction, but safe for buyers (builds trust)
-- **High tier**: Instant payment, but reputation at stake
-- **Motivation**: Deliver consistently to earn and maintain High tier
+- **New merchants** pay the cost of unproven trust (100% escrow) but face no
+  ceiling on ever reaching tier 4 — the path is purely volume + clean
+  settlement, not application or approval.
+- **Proven merchants** get instant settlement on in-range orders, but a
+  single refund/reclaim spike immediately raises their rate and can demote
+  them on the very next payment — there's no grace period to hide behind.
+- **Buyers** are protected by escrow scaled to exactly the risk the
+  merchant's own history implies, and can always reclaim a stalled order
+  once its expiry passes, without needing the merchant's or a facilitator's
+  cooperation.
+- **A rug attempt costs the most it possibly could**: the reclaim that
+  follows a failed delivery both proves the rug (on-chain, permanently, in
+  the `Payment` record) and resets the merchant to the same zero-trust
+  starting line as a brand-new address, plus a rebuild floor before they can
+  climb back out of tier 1.
 
-### For Buyers
-- **Low tier merchants**: Protected by escrow until delivery confirmed
-- **High tier merchants**: Faster, frictionless payments with proven reliability
-- **Recourse**: Can request refund if merchant fails (Low-tier)
+## On-Chain PDA Transparency
 
-### For Protocol
-- **Reduced fraud**: Tier system incentivizes honest merchant behavior
-- **Self-scaling**: Tier promotion is automatic based on metrics
-- **No centralized judgment**: Objective metrics drive tier decisions
+Everything a routing decision depends on — tier, average tx size, refund
+count, reclaim count, total settlement events — is a field on a PDA anyone
+can fetch and recompute from first principles (`recompute_tier` is public
+specifically so this is checkable without trusting the facilitator's
+off-chain view of the same data). Every `Payment` account is left open
+(never closed) after settlement, so a merchant's entire history —
+instant vs. escrowed, forced-full-escrow flags, refunds, reclaims — is a
+permanent, queryable, Explorer-linkable ledger.
 
 ## Platform Integration
 
-The system is designed as a **thin plug-in**:
-- Buyers and sellers don't change their workflow
-- Escrow and tier logic is transparent
-- Can be added to existing x402 implementations
-- No breaking changes to x402 protocol
+The program is a thin plug-in behind an x402 facilitator's `/verify` and
+`/settle`:
+- The facilitator looks up the merchant's `Merchant` PDA (keyed by `payTo`).
+- It calls `initiate_payment` instead of a plain SPL transfer; the program
+  itself performs the tiering, sizing, and splitting.
+- Buyers and sellers do not change anything about how they call the
+  facilitator — the routing decision is entirely inside this program.
+
+Because there is no standard SVM escrow/commerce scheme in x402 yet (the
+only proposal, PR #873, is closed/unmerged), any `extra` metadata describing
+this escrow (`escrowProgramId`, `escrowPda`, `tier`, `reservePercentBps`,
+`expiryUnixTime`) is necessarily non-standard — only a client that knows
+about this specific program will understand it. That's an explicit,
+documented tradeoff, not an oversight.
 
 ## Future Enhancements
 
-### Possible Extensions
-1. **Automatic tier promotion**: Promote to High after N successful deliveries
-2. **Reputation scoring**: Fine-grained scoring beyond Low/High
-3. **Dispute resolution**: On-chain arbitration for contested deliveries
-4. **Fee structure**: Different transaction fees based on tier
-5. **Time-locked escrow**: Auto-release if not confirmed within timeframe
-6. **Penalty system**: Demote High-tier merchants after failed deliveries
-
-### Extensibility Points
-- Custom tier scoring logic
-- Integration with oracle data
-- Multi-sig merchant recovery
-- Governance upgrades via DAO
-
-## Implementation Notes
-
-### Technology Stack
-- **Solana Blockchain**: High-speed, low-cost transactions
-- **Anchor Framework**: Safe Rust smart contract development
-- **SPL Token**: Standard token transfers for payments
-- **PDAs**: Program-derived accounts for merchant and payment records
-
-### Account Model
-- **Merchant Account**: Owned by program, keyed by `[b"merchant", merchant_pubkey]`
-- **Payment Account**: Owned by program, keyed by `[b"payment", buyer, merchant, order_id]`
-- **Token Accounts**: Standard SPL token accounts
-
-### Cost Estimation
-- Register merchant: ~1 SOL (one-time)
-- Initiate payment: ~0.1 SOL
-- Confirm/refund: ~0.1 SOL
-
-## Conclusion
-
-The x402 Solana Scoring System provides a minimal, effective mechanism for risk differentiation in p2p payments. By introducing just two tiers and automatic escrow/instant settlement logic, it dramatically improves buyer protection while maintaining minimal friction for proven merchants.
+- Address Lookup Table support so `initiate_payment`'s account list stays
+  within the SVM `exact` scheme's instruction-count conventions when wallets
+  inject their own Lighthouse/Memo instructions.
+- A facilitator-side dedup cache (mirroring the SVM spec's 120-second
+  recommendation) to guard against replayed settlement requests.
+- Configurable per-mint thresholds (today's constants assume a 6-decimal
+  stablecoin like USDC).
+- A Solana Attestation Service integration so a merchant's tier can be
+  read by *other* programs, not just this one.

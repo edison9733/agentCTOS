@@ -1,7 +1,7 @@
 {
   "name": "x402-scoring",
   "version": "0.1.0",
-  "description": "Solana program for x402 scoring system with Low/High merchant tiers",
+  "description": "Agent CTOS anti-rug escrow program for x402 on Solana: on-chain PDA merchant tiering (1-4) with size-scaled, history-derived escrow reserves",
   "main": "target/types/x402_scoring.ts",
   "scripts": {
     "build": "anchor build",
