@@ -49,7 +49,11 @@ import { X402Scoring } from "../target/types/x402_scoring";
 function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
   const idlPath = path.join(__dirname, "..", "target", "idl", "x402_scoring.json");
   const idl = JSON.parse(fs.readFileSync(idlPath, "utf8"));
-  const programId = new PublicKey(idl.metadata.address);
+  // Anchor 0.30+'s CLI puts the address at the top level (`idl.address`)
+  // instead of the 0.29-era `idl.metadata.address` — support either, since
+  // the installed `anchor` CLI binary can be newer than the pinned
+  // @coral-xyz/anchor npm package that actually loads this IDL.
+  const programId = new PublicKey(idl.address ?? idl.metadata.address);
   return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
 }
 
