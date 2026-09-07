@@ -103,7 +103,21 @@ function explorerAddr(addr: PublicKey, rpcUrl: string): string {
 }
 
 async function main() {
-  const provider = anchor.AnchorProvider.env();
+  // AnchorProvider.env() defaults to "processed" commitment, which only waits
+  // for a single node to have seen the transaction. Against a load-balanced
+  // endpoint that loses a race constantly: createMint returns, the next call
+  // lands on a node that hasn't caught up, and the Token program rejects the
+  // not-yet-visible account with InvalidAccountData. Localnet hides this
+  // because there is only one node to ask. Confirm at "confirmed" instead.
+  const env = anchor.AnchorProvider.env();
+  const connection = new anchor.web3.Connection(env.connection.rpcEndpoint, {
+    commitment: "confirmed",
+    confirmTransactionInitialTimeout: 90_000,
+  });
+  const provider = new anchor.AnchorProvider(connection, env.wallet, {
+    commitment: "confirmed",
+    preflightCommitment: "confirmed",
+  });
   anchor.setProvider(provider);
   const program = loadProgram(provider);
   const rpcUrl = provider.connection.rpcEndpoint;
