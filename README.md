@@ -29,7 +29,6 @@ deploying anything yourself.
 ```bash
 git clone https://github.com/edison9733/agentCTOS.git
 cd agentCTOS
-git checkout claude/x402-solana-scoring-p3yoot
 
 npm install
 anchor build
