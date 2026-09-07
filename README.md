@@ -1,16 +1,19 @@
-# Agent CTOS — x402 Anti-Rug Escrow Program
+# Agent CTOS — x402 Escrow for Solana
 
-A from-scratch Anchor escrow program for Solana that underwrites x402
-payments: every merchant is scored purely from on-chain settlement history,
-and every payment's escrow requirement is computed deterministically from
-that history at the moment of payment. There is no off-chain database and no
-human in the loop — a merchant's tier, reserve math, and full settlement
-history all live in on-chain PDAs that anyone can read on Solana Explorer.
+An escrow program that makes x402 payments recoverable. Every payment is held
+until the buyer confirms delivery — and if the merchant never delivers, the
+buyer takes the money back alone, with no cooperation from anyone.
 
-This exists because, as of today, Solana's x402 `exact` scheme has no native
-escrow/commerce spec (unlike EVM's Commerce Payments Protocol / x402r). This
-program is that missing piece: a merchant-underwriting facilitator shim you
-can drop in front of an x402 facilitator's `/verify` and `/settle` calls.
+x402's `exact` scheme on Solana is a single irreversible transfer: the buyer
+signs, the facilitator submits, and the money is gone the moment the
+transaction lands. If the merchant takes payment and disappears, there is no
+recourse. This program replaces that transfer.
+
+It also implements something the specification deliberately leaves out. The
+[SVM `exact` scheme](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md)
+separates payment semantics from what it calls a *Sponsor Acceptance Policy* —
+how the sponsoring party evaluates risk — and declares that out of scope. This
+is that policy, enforced on-chain.
 
 ## Live on devnet
 
@@ -20,9 +23,6 @@ can drop in front of an x402 facilitator's `/verify` and `/settle` calls.
 | Cluster | devnet |
 | Explorer | [view the program](https://explorer.solana.com/address/HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4?cluster=devnet) |
 | Tests | 9 passing |
-
-The program is already deployed, so you can clone and watch it work without
-deploying anything yourself.
 
 ## Quick Start
 
@@ -36,36 +36,111 @@ anchor build
 npm run demo
 ```
 
-That runs a five-act walkthrough against devnet — a merchant taking money and
-never delivering, a second merchant earning its way to tier 2, and the buyer
-recovering the stolen escrow with no merchant signature. Every number printed
-is re-read from the program's own on-chain accounts, and every step prints an
-Explorer link you can check independently.
+The demo runs four acts against devnet: a payment the merchant cannot touch, a
+second merchant who takes an order and vanishes, an honest delivery released by
+the buyer, and the buyer recovering the stolen escrow with no merchant
+signature anywhere in the transaction. Every step prints an Explorer link.
 
-To drive a single payment yourself instead:
+To drive a single payment yourself:
 
 ```bash
 npm run pay -- --amount 25                               # pay and confirm
 npm run pay -- --amount 5 --settle reclaim --timeout 60  # get rugged, then reclaim
 ```
 
-Presenting this? [PRESENT.md](PRESENT.md) is the run order, the lines worth
-saying out loud, and the two claims not to make.
+Presenting this? [PRESENT.md](PRESENT.md) is the run order and the lines worth
+saying out loud.
 
 **Requirements:** Rust, Solana CLI, Anchor 0.29.0, Node 18+, and a devnet
-wallet with ~0.1 SOL. If you don't have those yet — or anything below fails —
-**[RUNBOOK.md](RUNBOOK.md)** is the complete copy-paste path from a bare
-machine to a settled payment, including a troubleshooting table for every
-error this project has actually produced.
+wallet with ~0.1 SOL. If anything fails, **[RUNBOOK.md](RUNBOOK.md)** is the
+complete copy-paste path from a bare machine, with a troubleshooting table for
+every error this project has actually produced.
 
-> **macOS:** run `export COPYFILE_DISABLE=1` before `anchor test`, or the
-> local validator fails to unpack its own genesis archive.
+> **macOS:** run `export COPYFILE_DISABLE=1` before `anchor test`, or the local
+> validator fails to unpack its own genesis archive.
+
+## How it works
+
+A payment can end in exactly three ways, and the rule behind them is one
+sentence: **an instant reversal needs both parties to agree, and anything one
+party can do alone must wait for the clock.**
+
+| Instruction | Who signs | What happens |
+|---|---|---|
+| `confirm_delivery` | buyer | The merchant is paid, less the settlement fee. |
+| `refund_escrow` | buyer **and** merchant | The buyer is repaid in full, no fee. |
+| `reclaim_timeout` | buyer, after expiry | The buyer takes the money back. The merchant cannot block it. |
+
+That is what stops either side rugging the other. A buyer alone cannot take
+delivery and then pull the money back; a merchant alone cannot keep money the
+buyer never confirmed. Each party's unilateral route is time-gated by a
+deadline the buyer set when paying, which the merchant can see before
+delivering.
+
+### The escrow vault has no owner
+
+Funds sit in an SPL token account at seeds `[b"vault", payment_pubkey]`, whose
+authority is **the Payment account itself** — not a keypair, not an operator,
+not the deployer. Releases are signed by the Payment PDA's own seeds. There is
+no admin instruction anywhere in this program, and no key that can move a
+buyer's money.
+
+### The fee is a percentage, and only on success
+
+`FEE_BPS` is 50 — 0.50% of the order — charged **only when an order settles
+successfully**. Refunds and reclaims are free: a buyer who did not get what
+they paid for pays nothing.
+
+A percentage rather than a flat amount, because a flat fee would price out
+micropayments, and micropayments are x402's main use case. The treasury address
+is compiled into the program rather than stored in a config account, so no
+admin instruction can redirect it — changing it takes a program upgrade that
+anyone can see on-chain.
+
+### Order records do not accumulate rent
+
+Each order creates a Payment account, and an account left open forever costs
+more rent than a small payment is worth. So the order's outcome is emitted as
+an on-chain **event**, and `close_payment` deletes the finished record and
+returns its rent. Indexers read the events; nothing verifiable is lost.
+
+## Instructions
+
+- **`initiate_payment(amount, order_id, timeout_seconds)`** — moves the full
+  amount into the escrow vault and creates the Payment record. `timeout_seconds`
+  must be between 60 and 2,592,000 (30 days). The Payment account's address is
+  derived from the buyer, merchant and `order_id`, so a replayed order id is
+  rejected by the runtime rather than by a check.
+- **`confirm_delivery(order_id)`** — buyer-signed; pays the merchant the order
+  amount less the settlement fee, and closes the vault.
+- **`refund_escrow(order_id)`** — buyer- **and** merchant-signed; returns the
+  full amount to the buyer with no fee.
+- **`reclaim_timeout(order_id)`** — buyer-signed, only after `expiry`; returns
+  the full amount to the buyer with no fee.
+- **`close_payment(order_id)`** — buyer-signed; deletes a finished order record
+  and refunds its rent. Rejected while the escrow is still held.
+
+## Accounts
+
+### `Payment` — seeds `[b"payment", buyer, merchant, order_id]`
+
+| Field | Meaning |
+|---|---|
+| `buyer` / `merchant` | the two parties; the merchant is an address, not a record |
+| `mint` | the SPL token this order settles in |
+| `amount` | the full order price, all of which is escrowed |
+| `fee_amount` | the settlement fee charged; zero until settled, and zero forever on a refund or reclaim |
+| `status` | `EscrowHeld` → `Settled` \| `Refunded` \| `Reclaimed` |
+| `expiry` | unix timestamp after which the buyer may reclaim |
+
+### Escrow vault — seeds `[b"vault", payment_pubkey]`
+
+An SPL token account whose authority is the `Payment` PDA. See above.
 
 ## Using it from an AI agent (MCP)
 
 The point of this program is that an agent can pay a stranger safely. So it
-ships as an MCP server: seven tools an agent calls directly, with no knowledge
-of Solana accounts, PDAs or token programs.
+ships as an MCP server — five tools, no knowledge of Solana accounts required.
 
 ```bash
 npm run mcp
@@ -79,155 +154,30 @@ claude mcp add x402-escrow -- npx ts-node /ABSOLUTE/PATH/TO/agentCTOS/scripts/mc
 
 | Tool | What the agent does with it |
 |---|---|
-| `check_merchant` | Read a merchant's tier and history, and preview how a proposed payment would split, **before** paying. Read-only. |
-| `pay_merchant` | Pay under escrow. Returns the order id, the escrow/instant split, and the reclaim deadline. |
-| `check_payment` | Status of one order: still held, settled, or reclaimable now. |
-| `confirm_delivery` | Release the escrow — the only action that raises a merchant's tier. |
-| `refund_payment` | Cancel before delivery and take the escrow back. |
-| `reclaim_payment` | Recover funds from a merchant who never delivered. Needs no cooperation from them. |
-| `register_merchant` | Register the server's own wallet as a merchant, pinned to one settlement mint. |
+| `pay_merchant` | Pay under escrow. Returns the order id and the reclaim deadline. |
+| `check_payment` | Status of one order: still held, settled, or reclaimable now. Read-only. |
+| `confirm_delivery` | Release the escrow to the merchant. |
+| `reclaim_payment` | Recover funds from a merchant who never delivered. |
+| `close_order` | Reclaim a finished order's rent. |
 
 The server acts as a single wallet — your local Solana CLI keypair
-(`~/.config/solana/id.json`, override with `ANCHOR_WALLET`). That wallet is the
-buyer for payment tools and the owner for `register_merchant`. Point it at a
-cluster with `ANCHOR_PROVIDER_URL`.
+(`~/.config/solana/id.json`, override with `ANCHOR_WALLET`) — always as the
+buyer. Point it at a cluster with `ANCHOR_PROVIDER_URL`.
 
-A useful thing to notice in the tool descriptions: the agent is told to call
-`check_merchant` first when the counterparty is unfamiliar or the amount is
-large. The escrow protects it either way — but an agent that checks first can
-decline a merchant rather than merely survive one.
-
-## The Twelve Anti-Rug Rules
-
-The program implements these rules exactly, with no manual override
-instruction anywhere in the codebase:
-
-1. **Reserve scales with transaction size** — `escrow_amount = base_reserve + (tx_size × risk_multiplier)`
-2. **Size multiplier by tier** — a payment may reach at most `avg_historical_tx × tier_multiplier`:
-   - Tier 1 (new): 2x
-   - Tier 2 (proven): 10x
-   - Tier 3 (trusted): 50x
-   - Tier 4 (excellent): 100x
-3. **No N-x jumps** — a payment above that multiple is forced to full escrow, regardless of tier
-4. **New addresses = zero trust** — a fresh merchant PDA starts at tier 1 (100% escrow); there is no way to inherit history by rotating keys
-5. **Refund rate signal** — refund rate is tracked, and a rate over threshold drops the merchant to tier 1 (100% escrow) on its next payment
-6. **Reclaim rate signal** — reclaim (timeout) rate is tracked the same way, and carries the same consequence
-7. **Completed volume is input** — only confirmed/settled transactions feed the average tx size and tier math; a pending or disputed order never counts
-8. **No human opinion** — `recompute_tier` is a pure function of on-chain counters; anyone can call it and always gets the same answer
-9. **Trust ≤ collateral** — a tier only grants speed if the reserve requirement for that tx size is actually funded, atomically, in the same instruction
-10. **Velocity check** — a sudden pattern change (flat history → a huge bid) is caught by the same avg-relative check as rules 2/3
-11. **Reserve survives tier changes** — a payment's `escrow_amount` is fixed at creation and is never re-derived from a later tier change; the reclaim timeout on an open escrow always applies
-12. **Cold-start cost** — a reclaimed (timed-out) escrow resets the merchant to tier 1 and locks out promotion until a fresh batch of transactions is completed
-
-### The `/verify`-time decision tree
-
-This is implemented verbatim in `initiate_payment`:
-
-```
-tier = recompute_tier(merchant)      # pure function of the merchant's counters;
-                                     # bad refund/reclaim rates land it on tier 1 here
-
-if merchant_is_new OR tier == 1:
-    -> 100% escrow for the whole payment
-
-else if tx_size > avg_historical_tx_size × tier_multiplier:
-    -> force escrow for the entire amount (this transaction only; tier is untouched)
-
-else:
-    -> minimal reserve (base_reserve + tx_size × risk_multiplier), rest settles instantly
-```
-
-## Why On-Chain PDAs Instead of a Database
-
-A facilitator could keep merchant scores in an off-chain table — it's the
-fastest thing to build, but judges (and buyers) have to trust that table.
-Storing every merchant's tier, counters, and rate history in a Program
-Derived Address means anyone can independently verify the exact numbers that
-drove a routing decision, on Explorer, without trusting the facilitator's
-backend at all. That's the whole point of this design.
-
-## Accounts
-
-### `Merchant` PDA — seeds `[b"merchant", owner_pubkey]`
-| Field | Meaning |
-|---|---|
-| `mint` | the single SPL mint this merchant settles in, fixed at registration |
-| `tier` | 1 (new) – 4 (excellent) |
-| `completed_tx_count` | settled/confirmed transactions only (rule 7) |
-| `total_completed_volume` | sum of confirmed order amounts |
-| `avg_tx_size` | running average of confirmed order amounts — the baseline for the size/velocity check |
-| `refund_count` / `reclaim_count` | rug signals |
-| `total_settlement_events` | completed + refunded + reclaimed — the denominator for the rate signals |
-| `tier_floor_tx_count` | cold-start floor after a reclaim (rule 12) |
-
-### `Payment` PDA — seeds `[b"payment", buyer, merchant, order_id]`
-| Field | Meaning |
-|---|---|
-| `mint` | settlement mint, snapshotted so an audit needn't trust merchant state |
-| `amount` | full order price |
-| `escrow_amount` | portion held in the vault (immutable after creation — rule 11) |
-| `instant_amount` | portion sent straight to the merchant at initiation |
-| `tier_at_payment` | merchant tier snapshotted for audit |
-| `forced_full_escrow` | true if the size/velocity anomaly check triggered |
-| `status` | `EscrowHeld` → `Settled` \| `Refunded` \| `Reclaimed` |
-| `expiry` | unix timestamp after which the buyer may reclaim |
-
-`Payment` accounts are never closed, so the full settlement history of every
-order stays queryable on-chain — that's the transparency this design is for.
-
-### Escrow vault — an SPL token account at seeds `[b"vault", payment_pubkey]`
-Owned by the `Payment` PDA itself (not a human-held keypair). The program
-signs release/refund/reclaim transfers with the PDA's own seeds — there is no
-`escrow_authority` keypair anywhere, so no third party can ever move the
-funds.
-
-## Instructions
-
-- **`register_merchant()`** — creates a merchant PDA at tier 1, zero history,
-  and pins the SPL mint it settles in. Reputation is denominated: `avg_tx_size`
-  and `total_completed_volume` are bare `u64` counters, so a payment in any
-  other mint is rejected rather than summed into the same average.
-- **`initiate_payment(amount, order_id, timeout_seconds)`** — runs the
-  decision tree above, atomically splits `amount` into an instant transfer to
-  the merchant and an escrow deposit into the vault, and creates the
-  `Payment` record. `timeout_seconds` must be between 60 and 2,592,000 (30 days).
-- **`confirm_delivery(order_id)`** — buyer-signed; releases any escrowed
-  funds to the merchant, closes the vault, and folds the order into the
-  merchant's completed history (this is the only thing that ever raises
-  `avg_tx_size` or unlocks a higher tier).
-- **`refund_escrow(order_id)`** — buyer-signed; returns the escrowed funds to
-  the buyer before delivery and records a refund event.
-- **`reclaim_timeout(order_id)`** — buyer-signed, only callable after
-  `expiry`; unilaterally pulls the escrowed funds back, records a reclaim
-  event, and resets the merchant to tier 1 with a cold-start floor.
-- **`recompute_tier()`** — permissionless; recomputes a merchant's tier from
-  its own counters. Called automatically after every settlement event, and
-  exposed publicly so anyone can re-verify a merchant's tier independently.
-
-## Building
+## Building and testing
 
 ```bash
 npm install
 anchor build
-```
-
-The program ID is already committed in `lib.rs` and `Anchor.toml`. Run
-`anchor keys sync` only if you are deploying under a keypair of your own.
-
-## Testing
-
-```bash
 anchor test    # 9 passing, ~2 minutes
 ```
 
-On macOS, set `export COPYFILE_DISABLE=1` first — otherwise the test
-validator fails to unpack its own genesis archive (`extra entry found:
-"._genesis.bin"`), because macOS writes extended attributes into archives as
-`._` companion files.
+The program ID is committed in `lib.rs` and `Anchor.toml`. Run `anchor keys
+sync` only if you are deploying under a keypair of your own.
 
-The reclaim-timeout test sleeps for real past a 61-second escrow expiry
-(the program enforces a 60-second minimum timeout), so the full suite takes
-a little over a minute — that's expected, not a hang.
+One test genuinely sleeps 62 seconds: the program enforces a 60-second minimum
+escrow timeout, and that test waits it out rather than faking the clock. That
+is expected, not a hang.
 
 ## Deployment (devnet)
 
@@ -242,79 +192,9 @@ solana program deploy target/deploy/x402_scoring.so \
 ```
 
 `--with-compute-unit-price` is what gets the buffer writes through devnet
-congestion; without it the deploy tends to exhaust its retries on
-`Blockhash expired`. See [RUNBOOK.md](RUNBOOK.md) for resuming a failed
-deploy from its buffer, and for `solana program extend` when an upgraded
-binary no longer fits.
-
-## Live Demo
-
-`scripts/demo.ts` runs an end-to-end walkthrough against a real cluster: it
-registers a brand-new merchant and a "proven" one (seeded with five clean
-orders so it mechanically promotes to tier 2), then fires off real
-transactions that show the decision tree making a different call each time —
-full escrow for the new merchant, a small scaled reserve for the proven one,
-a forced full escrow when a payment blows past that merchant's own history,
-and finally a rug: a merchant that takes an order, never delivers, and has the
-escrow pulled back by the buyer alone once the timeout expires. It mints its own demo SPL token and uses your
-already-funded CLI wallet as the buyer, so it has no faucet dependency.
-
-```bash
-anchor build       # once, so target/idl + target/deploy exist
-npm run demo       # defaults to devnet, using ~/.config/solana/id.json
-```
-
-To drive a single payment yourself instead of the scripted narrative:
-
-```bash
-npm run pay -- --amount 25
-npm run pay -- --amount 5 --settle reclaim --timeout 60
-```
-
-`scripts/pay.ts` runs one order through register → initiate → settle and
-prints the escrow split and the merchant's counters before and after. See
-[RUNBOOK.md](RUNBOOK.md) for the full walkthrough, including how to promote a
-merchant to tier 2 and then watch a large order lose the discount.
-
-Every step prints the transaction signature plus a clickable
-`explorer.solana.com` link, and re-fetches the `Merchant`/`Payment` PDA state
-right after so what's on screen is exactly what's on-chain — nothing here is
-computed off-chain.
-
-To rehearse the same demo locally first (faster, no devnet RPC/confirmation
-delays):
-
-```bash
-solana-test-validator                                  # in one terminal
-anchor deploy --provider.cluster localnet               # in another terminal
-ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 npm run demo
-```
-
-## Prerequisites
-
-1. Node.js 18+ and a package manager (npm/pnpm/yarn)
-2. Rust via [rustup](https://rustup.rs)
-3. Solana CLI (`solana-install`), bundles a local test validator
-4. Anchor CLI **0.29.0** via AVM — the version this project builds against;
-   `latest` will not compile it:
-   ```bash
-   cargo install --git https://github.com/coral-xyz/anchor avm --locked
-   avm install 0.29.0 && avm use 0.29.0
-   ```
-5. `solana config set --url devnet`
-6. `solana-keygen new` for a local wallet, then `solana airdrop 2 --url devnet`.
-   Devnet airdrops are frequently rate-limited; if yours is,
-   [RUNBOOK.md](RUNBOOK.md#3-create-and-fund-a-wallet--once) covers the
-   proof-of-work faucet, which ignores IP limits.
-7. Nothing else — `npm run demo` and `npm run pay` mint their own demo SPL
-   token and create every token account they need, so there is no dependency
-   on a devnet USDC mint or a token faucet.
-8. **macOS:** `export COPYFILE_DISABLE=1`, or `solana-test-validator` fails to
-   unpack its own genesis archive.
-
-Note that each wallet needs an Associated Token Account for a mint before it
-can hold or receive that token — unlike EVM, you cannot send SPL tokens to a
-bare address. The scripts handle this for the accounts they create.
+congestion; without it the deploy tends to exhaust its retries on `Blockhash
+expired`. [RUNBOOK.md](RUNBOOK.md) covers resuming a failed deploy from its
+buffer, and `solana program extend` when an upgraded binary no longer fits.
 
 ## Error Codes
 
@@ -322,24 +202,43 @@ bare address. The scripts handle this for the accounts they create.
 |---|---|
 | `InvalidAmount` | payment amount was zero |
 | `InvalidTimeout` | timeout outside [60s, 30 days] |
-| `InvalidPaymentStatus` | operation not valid for the payment's current status |
-| `InvalidOrder` | order ID mismatch |
+| `InvalidPaymentStatus` | the order is already settled, refunded, or reclaimed |
+| `InvalidOrder` | order id mismatch |
 | `ReclaimNotYetAvailable` | called before the escrow's expiry |
-| `InvalidTokenOwner` / `InvalidMint` | token account doesn't belong to the expected party/mint |
-| `MintMismatch` | payment mint isn't the merchant's registered settlement mint |
-| `ArithmeticOverflow` / `ArithmeticUnderflow` | checked math guard tripped |
+| `InvalidTokenOwner` / `InvalidMint` | token account doesn't belong to the expected party or mint |
+| `InvalidMerchant` / `InvalidBuyer` | signer is not the party named on the payment |
+| `InvalidTreasury` | fee destination is not the compiled-in treasury |
+| `PaymentStillOpen` | tried to close a record whose escrow is still held |
+| `ArithmeticOverflow` | checked math guard tripped |
 
-## Security Notes
+## What this does not do
 
-- All fund-moving CPIs are signed by the `Payment` PDA's own seeds — no
-  operator keypair can ever authorize a release, refund, or reclaim.
-- All arithmetic is checked (`checked_add`/`checked_mul`/`checked_sub`);
-  overflow/underflow aborts the transaction instead of wrapping.
-- `escrow_amount` is fixed at payment creation and is never recomputed from a
-  later tier change (rule 11) — a merchant cannot retroactively unlock funds
-  by having their tier change after the fact.
-- This is a hackathon/demo-grade implementation. It has not been audited.
-  Production use would additionally want: a duplicate-settlement dedup guard
-  at the facilitator layer, Address Lookup Table support for larger
-  transactions, and a security review of the tier-recompute thresholds
-  against real fraud data.
+Stated plainly, because these are the first questions a reviewer asks:
+
+- **It cannot tell whether goods actually arrived.** No on-chain system can. A
+  buyer who takes delivery and refuses to confirm forces the merchant to wait
+  out the timeout and lose the payment. That is the oracle problem, and any
+  design claiming to solve it has hidden a trusted party somewhere.
+- **If the buyer disappears, the escrow is stuck.** Both exits need the buyer's
+  signature. The design chose "funds frozen" over "funds released to the wrong
+  party" — a system that can pay out without the buyer can be made to pay out
+  against them.
+- **Token-2022 mints are not supported.** The program uses the legacy SPL Token
+  program. Transfer-fee extensions would also break the escrow accounting,
+  since the amount received would not match the amount sent.
+- **No partial delivery or dispute resolution.** An order is all-or-nothing.
+- **It is not audited.** This is hackathon-grade. A production version would
+  want a permissionless post-expiry settlement path for abandoned buyers, a
+  facilitator-side duplicate-settlement guard, and Address Lookup Table support.
+
+## Security notes
+
+- Every fund-moving CPI is signed by the `Payment` PDA's own seeds. No operator
+  keypair can authorise a release, refund, or reclaim.
+- All arithmetic is checked; overflow aborts the transaction rather than
+  wrapping.
+- The fee destination is constrained to a compiled-in treasury address, so a
+  caller cannot redirect the fee to themselves.
+- The program is upgradeable and the upgrade authority is a single wallet. That
+  is a real trusted party. Before mainnet, `solana program set-upgrade-authority
+  --final`, or hand it to a multisig with a timelock.

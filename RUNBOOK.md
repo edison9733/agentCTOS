@@ -56,7 +56,6 @@ source ~/.zshrc
 ```bash
 git clone https://github.com/edison9733/agentCTOS.git
 cd agentCTOS
-git checkout claude/x402-solana-scoring-p3yoot
 npm install
 ```
 
@@ -113,7 +112,7 @@ export ANCHOR_PROVIDER_URL="https://api.devnet.solana.com"
 npm run demo
 ```
 
-Five acts, ~2 minutes. Each states a claim, then proves it with a real devnet
+Four acts, ~2 minutes. Each states a claim, then proves it with a real devnet
 transaction and re-reads the result from the program's own accounts.
 
 **If you hit `429 Too Many Requests`,** the public devnet RPC is throttling
@@ -129,7 +128,7 @@ the URL with `no matches found`.
 
 ### Presenting it
 
-Act 5 waits out the remaining escrow timeout, which is ~45 seconds of a
+Act 4 waits out the remaining escrow timeout, which is ~45 seconds of a
 progress line and nothing else. Two ways to handle that:
 
 - **Run it once before you present** and leave the finished output on screen.
@@ -155,55 +154,51 @@ so you choose the amount and how it settles:
 npm run pay -- --amount 25
 ```
 
-That registers a fresh merchant, pays it 25 tokens, and confirms delivery —
-printing the escrow split, both token balances, and the merchant's counters
-before and after.
+That generates a merchant, pays them 25 tokens under escrow, confirms
+delivery, and closes the order record to reclaim its rent — printing both
+token balances and the settlement fee along the way.
 
 | Command | What it shows |
 |---|---|
-| `npm run pay -- --amount 25` | The happy path. New merchant → tier 1 → 100% escrowed → released on confirmation. |
-| `npm run pay -- --amount 25 --settle refund` | Buyer changes their mind before delivery; escrow returns and a refund event is recorded. |
+| `npm run pay -- --amount 25` | The happy path. Fully escrowed, released on confirmation, 0.50% fee. |
+| `npm run pay -- --amount 25 --settle refund` | Cancelled by mutual agreement; the buyer is repaid in full, no fee. |
 | `npm run pay -- --amount 5 --settle reclaim --timeout 60` | The rug. Merchant never delivers; after 60s the buyer takes the money back **with no merchant signature**. |
 | `npm run pay -- --amount 25 --settle hold` | Leaves the escrow open so you can inspect the vault on Explorer. |
 
-### Building a merchant's reputation
+### The two rules worth showing
 
-A merchant's tier is a pure function of its settled orders, so you can watch
-it move. The script prints the exact command to reuse the merchant it just
-created:
-
-```bash
-npm run pay -- --amount 10 --merchant <MERCHANT_OWNER_PUBKEY>
-```
-
-Run that five times with the same merchant. On the fifth, `tier` goes
-`1 → 2` — and the *sixth* payment will be mostly instant instead of fully
-escrowed, because tier 2 only requires a 10% reserve.
-
-Then try one large order against that same merchant:
+A refund needs **both** signatures, so neither side can reverse a payment
+alone:
 
 ```bash
-npm run pay -- --amount 500 --merchant <MERCHANT_OWNER_PUBKEY>
+npm run pay -- --amount 25 --settle refund
 ```
 
-It gets forced back to 100% escrow with `forced_full_escrow: true` — 500 is
-more than 10× its ~10-token average, so the size check revokes the tier
-discount for that payment only. This is the single most convincing thing you
-can show live, because the merchant's tier is still 2; it's the *payment* that
-was judged, not the merchant.
+A reclaim needs **only the buyer**, but only after the deadline:
+
+```bash
+npm run pay -- --amount 5 --settle reclaim --timeout 60
+```
+
+Together those are the whole design: an instant reversal needs both parties to
+agree, and anything one party can do alone has to wait for the clock.
 
 ---
 
 ## 7. Verify it independently
 
 Everything the demo prints is re-read from on-chain accounts, but don't take
-its word for it. Both scripts print Explorer links; open a **Merchant PDA**
-link and you'll see the raw account data — tier, counters, settlement history
-— with no backend of ours in the path.
+its word for it. Leave an escrow open and read it yourself:
 
 ```bash
-solana account <MERCHANT_PDA> --url devnet     # the same bytes, from the CLI
+npm run pay -- --amount 25 --settle hold
+solana account <PAYMENT_PDA> --url devnet
 ```
+
+The same bytes, from the CLI, with no backend of ours in the path. Open the
+vault account beside it on Explorer: its authority is the payment account
+itself, not a keypair, which is what "no operator can move the funds" means in
+practice.
 
 ---
 

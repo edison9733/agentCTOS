@@ -46,7 +46,7 @@ npm run demo 2>&1 | tee demo-output.txt
 
 About two minutes. Leaves the full transcript on screen *and* in
 `demo-output.txt`. **This is your primary artifact.** Open one Explorer link
-from the output — a Merchant PDA — and leave that tab ready.
+from the output — the rugged order's Payment account — and leave that tab ready.
 
 ---
 
@@ -62,7 +62,7 @@ If you'd rather run it live:
 npm run demo
 ```
 
-Act 5 pauses about 45 seconds waiting out the escrow expiry. That pause is
+Act 4 pauses about 45 seconds waiting out the escrow expiry. That pause is
 the most convincing part of the demo if you narrate it:
 
 > "The merchant can't stop this clock. When it expires the buyer takes the
@@ -70,59 +70,37 @@ the most convincing part of the demo if you narrate it:
 
 ---
 
-## Phase 3 — the tier story
+## Phase 3 — the guarantee, on demand
 
-Use this when asked *how does a merchant earn trust?* Start a fresh merchant
-so the numbers are clean:
-
-```bash
-npm run pay -- --amount 10
-```
-
-Copy the merchant owner pubkey it prints at the end, then:
+Use this when asked *what actually stops a merchant taking the money?*
 
 ```bash
-export MERCHANT=<PASTE_MERCHANT_OWNER_PUBKEY>
+npm run pay -- --amount 5 --settle reclaim --timeout 60
 ```
 
-Four more settlements — five total is `MIN_TX_TIER_2`:
+It pays a merchant who never delivers, waits out the 60-second deadline, and
+recovers the money. Watch the signer list: only the buyer.
+
+> "The merchant was not asked. They could not object, could not stall, could
+> not extend the deadline. That is the whole guarantee."
+
+Then the counterpart — why this is not just a buyer-favouring system:
 
 ```bash
-npm run pay -- --amount 10 --merchant $MERCHANT
-npm run pay -- --amount 10 --merchant $MERCHANT
-npm run pay -- --amount 10 --merchant $MERCHANT
-npm run pay -- --amount 10 --merchant $MERCHANT
+npm run pay -- --amount 25 --settle refund
 ```
 
-The fourth prints **`tier   1 → 2`**. Promotion is arithmetic on counters —
-no operator, no allowlist, no appeal.
+A refund needs both signatures. Say why:
 
-```bash
-npm run pay -- --amount 50 --merchant $MERCHANT
-```
-
-First non-zero `instant_amount`: about 10% held, the rest settles instantly.
-Trust bought speed, and only speed.
-
-```bash
-npm run pay -- --amount 500 --merchant $MERCHANT
-```
-
-Snaps back to **100% escrow** with `forced_full_escrow  true` — while
-`tier_at_payment` still reads `2`.
-
-> "The merchant kept its tier. The payment lost the discount."
-
-That sentence is the whole design. The tier is a property of the merchant;
-the reserve is a property of the payment.
-
----
+> "If the buyer could refund alone, they would take delivery and pull the money
+> back. An instant reversal needs both parties. Anything one party does alone
+> has to wait for the clock."
 
 ## Phase 4 — single scenarios on demand
 
 ```bash
 npm run pay -- --amount 25                                # pay, then confirm
-npm run pay -- --amount 25 --settle refund                # buyer refunds pre-delivery
+npm run pay -- --amount 25 --settle refund                # cancelled by mutual agreement
 npm run pay -- --amount 5 --settle reclaim --timeout 60   # the rug, in 60 seconds
 npm run pay -- --amount 25 --settle hold                  # leave escrow open to inspect
 ```
@@ -131,13 +109,16 @@ npm run pay -- --amount 25 --settle hold                  # leave escrow open to
 
 ## Phase 5 — "how do I know this isn't a database?"
 
+Leave an escrow open, then read it straight off the chain:
+
 ```bash
-solana account <MERCHANT_PDA> --url devnet
+npm run pay -- --amount 25 --settle hold
+solana account <PAYMENT_PDA> --url devnet
 ```
 
-Raw account bytes off devnet, with none of our code in the path. Then open
-the same PDA on Explorer. Anyone can recompute the tier from those counters —
-`recompute_tier` is permissionless precisely so they can.
+Raw account bytes off devnet, with none of our code in the path. Then open the
+same account on Explorer, and the vault beside it — the vault's authority is
+the payment account itself, which is how you show there is no key to steal.
 
 ---
 
@@ -148,7 +129,7 @@ the same PDA on Explorer. Anyone can recompute the tier from those counters —
 | `429 Too Many Requests` | Your shell lost `ANCHOR_PROVIDER_URL`. Re-run Phase 0. |
 | `Test validator does not look started` | `export COPYFILE_DISABLE=1 && rm -rf .anchor/test-ledger test-ledger` |
 | `no matches found: https://...` | zsh globbed the `?`. Quote the URL. |
-| `MintMismatch` on `--merchant` | You're pointing at a merchant registered under a different mint. Start a fresh one. |
+| `--merchant also needs --mint` | This program keeps no merchant record, so the token has to be named explicitly. |
 | Anything else | [RUNBOOK.md](RUNBOOK.md#troubleshooting) has the full table. |
 
 ---
@@ -158,11 +139,11 @@ the same PDA on Explorer. Anyone can recompute the tier from those counters —
 | | |
 |---|---|
 | Program ID | `HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4` (devnet) |
-| Tiers | 1 new · 2 proven · 3 trusted · 4 excellent |
-| Settlements to reach each | 5 / 20 / 50 |
-| Reserve by tier | 100% / 10% / 3% / 1%, plus a flat base |
-| Size ceiling by tier | 2× / 10× / 50× / 100× the merchant's own average |
-| Rug penalty | reset to tier 1, plus 10 clean settlements before promotion |
+| Escrowed per payment | 100% — the merchant is paid nothing up front |
+| Settlement fee | 0.50%, charged only when an order succeeds |
+| Refunds and reclaims | free |
+| Refund | needs both the buyer's and the merchant's signature |
+| Reclaim | buyer alone, after the expiry |
 | Escrow timeout range | 60 seconds to 30 days |
 
 ---
@@ -174,6 +155,9 @@ follow-up will cost you more credibility than the claim ever bought. Say
 "hackathon-grade, and here's what a production version would need" — the
 Security Notes in [README.md](README.md#security-notes) list exactly that.
 
-**Don't say "this prevents fraud."** It prices it. A merchant can still take
-a tier-1 order and vanish; what it cannot do is take the money, and the
-attempt is permanently on-chain against its address.
+**Don't say "this prevents fraud."** It makes fraud unprofitable. A merchant
+can still take an order and vanish — what they cannot do is keep the money.
+And say plainly what it does not solve: the chain cannot see whether goods
+arrived, so a buyer who takes delivery and refuses to confirm still costs the
+merchant the payment. Naming that before you are asked is worth more than any
+answer you give after.
