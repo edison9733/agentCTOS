@@ -49,6 +49,9 @@ npm run pay -- --amount 25                               # pay and confirm
 npm run pay -- --amount 5 --settle reclaim --timeout 60  # get rugged, then reclaim
 ```
 
+Presenting this? [PRESENT.md](PRESENT.md) is the run order, the lines worth
+saying out loud, and the two claims not to make.
+
 **Requirements:** Rust, Solana CLI, Anchor 0.29.0, Node 18+, and a devnet
 wallet with ~0.1 SOL. If you don't have those yet — or anything below fails —
 **[RUNBOOK.md](RUNBOOK.md)** is the complete copy-paste path from a bare
