@@ -79,18 +79,26 @@ reclaim (rule 12).
 ### The `/verify`-Time Decision Tree
 
 ```
-if merchant_is_new OR merchant_tier == 1:
+tier = recompute_tier(merchant)     # pure function of the merchant's own
+                                    # counters; refund/reclaim rates over
+                                    # threshold land it on tier 1 here
+
+if merchant_is_new OR tier == 1:
     -> 100% escrow for all transactions
 
 else if tx_size > avg_historical_size × tier_multiplier:
     -> force escrow for the entire amount (this tx only — tier is untouched)
 
-else if refund_rate > threshold OR reclaim_rate > threshold:
-    -> lower tier, recalculate the reserve under the new tier
-
 else:
     -> instant settlement, minimal reserve per tier
 ```
+
+The tier is recomputed at the top rather than read from storage, so a stale
+stored value can never price a payment and demotion follows exactly the same
+rule as promotion. An earlier version demoted by one step here while
+`recompute_tier` dropped straight to tier 1 from the same counters, which
+made a merchant's escrow price depend on which instruction had run
+last — a contradiction of rule 8.
 
 This tree runs once, atomically, inside `initiate_payment`. The buyer's
 tokens are split in the same instruction: the escrow slice moves to the
@@ -153,14 +161,27 @@ reset to 1 by a later reclaim — no already-open escrow's terms move. The
 reclaim timeout on an open escrow always applies regardless of what happens
 to the merchant's tier in the meantime.
 
+### Reputation is denominated (one merchant, one mint)
+`avg_tx_size` and `total_completed_volume` are bare `u64` counters with no
+unit attached, so they are only meaningful if every payment folded into them
+is in the same token. A merchant therefore pins its settlement mint at
+registration, and `initiate_payment` rejects any payment in a different mint
+with `MintMismatch`. Without that constraint a merchant could mint a
+worthless token, settle large orders in it, and lift the `avg_tx_size`
+baseline that the size-anomaly ceiling (`avg × tier_multiplier`) is derived
+from — buying a higher instant-settlement ceiling in a mint that actually
+matters. `Payment` snapshots its own mint too, so auditing a historical
+order never requires trusting the merchant account's current state.
+
 ## Incentive Alignment
 
 - **New merchants** pay the cost of unproven trust (100% escrow) but face no
   ceiling on ever reaching tier 4 — the path is purely volume + clean
   settlement, not application or approval.
 - **Proven merchants** get instant settlement on in-range orders, but a
-  single refund/reclaim spike immediately raises their rate and can demote
-  them on the very next payment — there's no grace period to hide behind.
+  single refund/reclaim spike immediately raises their rate and drops them
+  to tier 1 on the very next payment — there's no grace period to hide
+  behind, and no partial demotion to soften it.
 - **Buyers** are protected by escrow scaled to exactly the risk the
   merchant's own history implies, and can always reclaim a stalled order
   once its expiry passes, without needing the merchant's or a facilitator's

@@ -12,17 +12,52 @@ escrow/commerce spec (unlike EVM's Commerce Payments Protocol / x402r). This
 program is that missing piece: a merchant-underwriting facilitator shim you
 can drop in front of an x402 facilitator's `/verify` and `/settle` calls.
 
+## Live on devnet
+
+| | |
+|---|---|
+| Program ID | `HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4` |
+| Cluster | devnet |
+| Explorer | [view the program](https://explorer.solana.com/address/HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4?cluster=devnet) |
+| Tests | 9 passing |
+
+The program is already deployed, so you can clone and watch it work without
+deploying anything yourself.
+
 ## Quick Start
 
-New to the project? [RUNBOOK.md](RUNBOOK.md) is the copy-paste path from a
-bare machine to a settled payment — toolchain install, build, tests, the
-demo, and driving your own transactions.
-
 ```bash
-git clone https://github.com/edison9733/agentCTOS.git && cd agentCTOS
-npm install && anchor build
+git clone https://github.com/edison9733/agentCTOS.git
+cd agentCTOS
+git checkout claude/x402-solana-scoring-p3yoot
+
+npm install
+anchor build
+
 npm run demo
 ```
+
+That runs a five-act walkthrough against devnet — a merchant taking money and
+never delivering, a second merchant earning its way to tier 2, and the buyer
+recovering the stolen escrow with no merchant signature. Every number printed
+is re-read from the program's own on-chain accounts, and every step prints an
+Explorer link you can check independently.
+
+To drive a single payment yourself instead:
+
+```bash
+npm run pay -- --amount 25                               # pay and confirm
+npm run pay -- --amount 5 --settle reclaim --timeout 60  # get rugged, then reclaim
+```
+
+**Requirements:** Rust, Solana CLI, Anchor 0.29.0, Node 18+, and a devnet
+wallet with ~0.1 SOL. If you don't have those yet — or anything below fails —
+**[RUNBOOK.md](RUNBOOK.md)** is the complete copy-paste path from a bare
+machine to a settled payment, including a troubleshooting table for every
+error this project has actually produced.
+
+> **macOS:** run `export COPYFILE_DISABLE=1` before `anchor test`, or the
+> local validator fails to unpack its own genesis archive.
 
 ## The Twelve Anti-Rug Rules
 
@@ -37,8 +72,8 @@ instruction anywhere in the codebase:
    - Tier 4 (excellent): 100x
 3. **No N-x jumps** — a payment above that multiple is forced to full escrow, regardless of tier
 4. **New addresses = zero trust** — a fresh merchant PDA starts at tier 1 (100% escrow); there is no way to inherit history by rotating keys
-5. **Refund rate signal** — refund rate is tracked and demotes the tier when it crosses a threshold
-6. **Reclaim rate signal** — reclaim (timeout) rate is tracked and demotes the tier when it crosses a threshold
+5. **Refund rate signal** — refund rate is tracked, and a rate over threshold drops the merchant to tier 1 (100% escrow) on its next payment
+6. **Reclaim rate signal** — reclaim (timeout) rate is tracked the same way, and carries the same consequence
 7. **Completed volume is input** — only confirmed/settled transactions feed the average tx size and tier math; a pending or disputed order never counts
 8. **No human opinion** — `recompute_tier` is a pure function of on-chain counters; anyone can call it and always gets the same answer
 9. **Trust ≤ collateral** — a tier only grants speed if the reserve requirement for that tx size is actually funded, atomically, in the same instruction
@@ -144,7 +179,7 @@ The program ID is already committed in `lib.rs` and `Anchor.toml`. Run
 ## Testing
 
 ```bash
-anchor test
+anchor test    # 9 passing, ~2 minutes
 ```
 
 On macOS, set `export COPYFILE_DISABLE=1` first — otherwise the test
@@ -222,16 +257,22 @@ ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 npm run demo
 1. Node.js 18+ and a package manager (npm/pnpm/yarn)
 2. Rust via [rustup](https://rustup.rs)
 3. Solana CLI (`solana-install`), bundles a local test validator
-4. Anchor CLI via AVM:
+4. Anchor CLI **0.29.0** via AVM — the version this project builds against;
+   `latest` will not compile it:
    ```bash
-   cargo install --git https://github.com/coral-xyz/anchor avm
-   avm install latest && avm use latest
+   cargo install --git https://github.com/coral-xyz/anchor avm --locked
+   avm install 0.29.0 && avm use 0.29.0
    ```
 5. `solana config set --url devnet`
-6. `solana-keygen new` for a local wallet, then `solana airdrop 2 --url devnet`
+6. `solana-keygen new` for a local wallet, then `solana airdrop 2 --url devnet`.
+   Devnet airdrops are frequently rate-limited; if yours is,
+   [RUNBOOK.md](RUNBOOK.md#3-create-and-fund-a-wallet--once) covers the
+   proof-of-work faucet, which ignores IP limits.
 7. Nothing else — `npm run demo` and `npm run pay` mint their own demo SPL
    token and create every token account they need, so there is no dependency
    on a devnet USDC mint or a token faucet.
+8. **macOS:** `export COPYFILE_DISABLE=1`, or `solana-test-validator` fails to
+   unpack its own genesis archive.
 
 Note that each wallet needs an Associated Token Account for a mint before it
 can hold or receive that token — unlike EVM, you cannot send SPL tokens to a
