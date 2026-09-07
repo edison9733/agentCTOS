@@ -12,6 +12,18 @@ escrow/commerce spec (unlike EVM's Commerce Payments Protocol / x402r). This
 program is that missing piece: a merchant-underwriting facilitator shim you
 can drop in front of an x402 facilitator's `/verify` and `/settle` calls.
 
+## Quick Start
+
+New to the project? [RUNBOOK.md](RUNBOOK.md) is the copy-paste path from a
+bare machine to a settled payment — toolchain install, build, tests, the
+demo, and driving your own transactions.
+
+```bash
+git clone https://github.com/edison9733/agentCTOS.git && cd agentCTOS
+npm install && anchor build
+npm run demo
+```
+
 ## The Twelve Anti-Rug Rules
 
 The program implements these rules exactly, with no manual override
@@ -39,14 +51,14 @@ instruction anywhere in the codebase:
 This is implemented verbatim in `initiate_payment`:
 
 ```
-if merchant_is_new OR merchant_tier == 1:
+tier = recompute_tier(merchant)      # pure function of the merchant's counters;
+                                     # bad refund/reclaim rates land it on tier 1 here
+
+if merchant_is_new OR tier == 1:
     -> 100% escrow for the whole payment
 
 else if tx_size > avg_historical_tx_size × tier_multiplier:
     -> force escrow for the entire amount (this transaction only; tier is untouched)
-
-else if refund_rate > threshold OR reclaim_rate > threshold:
-    -> demote the tier by one, recalculate the reserve under the new tier
 
 else:
     -> minimal reserve (base_reserve + tx_size × risk_multiplier), rest settles instantly
@@ -66,6 +78,7 @@ backend at all. That's the whole point of this design.
 ### `Merchant` PDA — seeds `[b"merchant", owner_pubkey]`
 | Field | Meaning |
 |---|---|
+| `mint` | the single SPL mint this merchant settles in, fixed at registration |
 | `tier` | 1 (new) – 4 (excellent) |
 | `completed_tx_count` | settled/confirmed transactions only (rule 7) |
 | `total_completed_volume` | sum of confirmed order amounts |
@@ -77,6 +90,7 @@ backend at all. That's the whole point of this design.
 ### `Payment` PDA — seeds `[b"payment", buyer, merchant, order_id]`
 | Field | Meaning |
 |---|---|
+| `mint` | settlement mint, snapshotted so an audit needn't trust merchant state |
 | `amount` | full order price |
 | `escrow_amount` | portion held in the vault (immutable after creation — rule 11) |
 | `instant_amount` | portion sent straight to the merchant at initiation |
@@ -96,7 +110,10 @@ funds.
 
 ## Instructions
 
-- **`register_merchant()`** — creates a merchant PDA at tier 1, zero history.
+- **`register_merchant()`** — creates a merchant PDA at tier 1, zero history,
+  and pins the SPL mint it settles in. Reputation is denominated: `avg_tx_size`
+  and `total_completed_volume` are bare `u64` counters, so a payment in any
+  other mint is rejected rather than summed into the same average.
 - **`initiate_payment(amount, order_id, timeout_seconds)`** — runs the
   decision tree above, atomically splits `amount` into an instant transfer to
   the merchant and an escrow deposit into the vault, and creates the
@@ -117,16 +134,23 @@ funds.
 ## Building
 
 ```bash
-# One-time toolchain setup (see the Prerequisites section below)
-anchor keys sync        # writes your real program ID into lib.rs and Anchor.toml
+npm install
 anchor build
 ```
+
+The program ID is already committed in `lib.rs` and `Anchor.toml`. Run
+`anchor keys sync` only if you are deploying under a keypair of your own.
 
 ## Testing
 
 ```bash
 anchor test
 ```
+
+On macOS, set `export COPYFILE_DISABLE=1` first — otherwise the test
+validator fails to unpack its own genesis archive (`extra entry found:
+"._genesis.bin"`), because macOS writes extended attributes into archives as
+`._` companion files.
 
 The reclaim-timeout test sleeps for real past a 61-second escrow expiry
 (the program enforces a 60-second minimum timeout), so the full suite takes
@@ -137,8 +161,18 @@ a little over a minute — that's expected, not a hang.
 ```bash
 solana config set --url devnet
 solana airdrop 2
-anchor deploy
+
+solana program deploy target/deploy/x402_scoring.so \
+  --program-id target/deploy/x402_scoring-keypair.json \
+  --use-rpc --max-sign-attempts 50 \
+  --with-compute-unit-price 50000
 ```
+
+`--with-compute-unit-price` is what gets the buffer writes through devnet
+congestion; without it the deploy tends to exhaust its retries on
+`Blockhash expired`. See [RUNBOOK.md](RUNBOOK.md) for resuming a failed
+deploy from its buffer, and for `solana program extend` when an upgraded
+binary no longer fits.
 
 ## Live Demo
 
@@ -148,13 +182,26 @@ orders so it mechanically promotes to tier 2), then fires off real
 transactions that show the decision tree making a different call each time —
 full escrow for the new merchant, a small scaled reserve for the proven one,
 a forced full escrow when a payment blows past that merchant's own history,
-and a buyer-initiated refund. It mints its own demo SPL token and uses your
+and finally a rug: a merchant that takes an order, never delivers, and has the
+escrow pulled back by the buyer alone once the timeout expires. It mints its own demo SPL token and uses your
 already-funded CLI wallet as the buyer, so it has no faucet dependency.
 
 ```bash
-anchor build       # once, so target/idl + target/types exist
+anchor build       # once, so target/idl + target/deploy exist
 npm run demo       # defaults to devnet, using ~/.config/solana/id.json
 ```
+
+To drive a single payment yourself instead of the scripted narrative:
+
+```bash
+npm run pay -- --amount 25
+npm run pay -- --amount 5 --settle reclaim --timeout 60
+```
+
+`scripts/pay.ts` runs one order through register → initiate → settle and
+prints the escrow split and the merchant's counters before and after. See
+[RUNBOOK.md](RUNBOOK.md) for the full walkthrough, including how to promote a
+merchant to tier 2 and then watch a large order lose the discount.
 
 Every step prints the transaction signature plus a clickable
 `explorer.solana.com` link, and re-fetches the `Merchant`/`Payment` PDA state
@@ -182,12 +229,13 @@ ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 npm run demo
    ```
 5. `solana config set --url devnet`
 6. `solana-keygen new` for a local wallet, then `solana airdrop 2 --url devnet`
-7. A devnet SPL mint to use as the payment token (a devnet USDC mint is
-   commonly used — verify the current address against your faucet before
-   using it, mint addresses on devnet do get retired/reissued)
-8. Each wallet needs an Associated Token Account (ATA) for that mint before
-   it can hold or receive tokens — unlike EVM, you cannot send SPL tokens to
-   a bare address.
+7. Nothing else — `npm run demo` and `npm run pay` mint their own demo SPL
+   token and create every token account they need, so there is no dependency
+   on a devnet USDC mint or a token faucet.
+
+Note that each wallet needs an Associated Token Account for a mint before it
+can hold or receive that token — unlike EVM, you cannot send SPL tokens to a
+bare address. The scripts handle this for the accounts they create.
 
 ## Error Codes
 
@@ -199,6 +247,7 @@ ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 npm run demo
 | `InvalidOrder` | order ID mismatch |
 | `ReclaimNotYetAvailable` | called before the escrow's expiry |
 | `InvalidTokenOwner` / `InvalidMint` | token account doesn't belong to the expected party/mint |
+| `MintMismatch` | payment mint isn't the merchant's registered settlement mint |
 | `ArithmeticOverflow` / `ArithmeticUnderflow` | checked math guard tripped |
 
 ## Security Notes
