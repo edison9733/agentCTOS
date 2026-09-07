@@ -8,7 +8,8 @@
     "test": "anchor test",
     "deploy": "anchor deploy",
     "demo": "npx ts-node scripts/demo.ts",
-    "pay": "npx ts-node scripts/pay.ts"
+    "pay": "npx ts-node scripts/pay.ts",
+    "mcp": "npx ts-node scripts/mcp-server.ts"
   },
   "keywords": [
     "solana",
@@ -21,8 +22,8 @@
   "license": "MIT",
   "devDependencies": {
     "@coral-xyz/anchor": "^0.29",
-    "@solana/web3.js": "^1.91",
     "@solana/spl-token": "^0.3",
+    "@solana/web3.js": "^1.91",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^9.0.0",
     "@types/node": "^20",
@@ -31,5 +32,9 @@
     "ts-mocha": "^10.0.0",
     "ts-node": "^10.9.1",
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
   }
 }

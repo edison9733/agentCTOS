@@ -61,6 +61,42 @@ error this project has actually produced.
 > **macOS:** run `export COPYFILE_DISABLE=1` before `anchor test`, or the
 > local validator fails to unpack its own genesis archive.
 
+## Using it from an AI agent (MCP)
+
+The point of this program is that an agent can pay a stranger safely. So it
+ships as an MCP server: seven tools an agent calls directly, with no knowledge
+of Solana accounts, PDAs or token programs.
+
+```bash
+npm run mcp
+```
+
+Wire it into Claude Code:
+
+```bash
+claude mcp add x402-escrow -- npx ts-node /ABSOLUTE/PATH/TO/agentCTOS/scripts/mcp-server.ts
+```
+
+| Tool | What the agent does with it |
+|---|---|
+| `check_merchant` | Read a merchant's tier and history, and preview how a proposed payment would split, **before** paying. Read-only. |
+| `pay_merchant` | Pay under escrow. Returns the order id, the escrow/instant split, and the reclaim deadline. |
+| `check_payment` | Status of one order: still held, settled, or reclaimable now. |
+| `confirm_delivery` | Release the escrow — the only action that raises a merchant's tier. |
+| `refund_payment` | Cancel before delivery and take the escrow back. |
+| `reclaim_payment` | Recover funds from a merchant who never delivered. Needs no cooperation from them. |
+| `register_merchant` | Register the server's own wallet as a merchant, pinned to one settlement mint. |
+
+The server acts as a single wallet — your local Solana CLI keypair
+(`~/.config/solana/id.json`, override with `ANCHOR_WALLET`). That wallet is the
+buyer for payment tools and the owner for `register_merchant`. Point it at a
+cluster with `ANCHOR_PROVIDER_URL`.
+
+A useful thing to notice in the tool descriptions: the agent is told to call
+`check_merchant` first when the counterparty is unfamiliar or the amount is
+large. The escrow protects it either way — but an agent that checks first can
+decline a merchant rather than merely survive one.
+
 ## The Twelve Anti-Rug Rules
 
 The program implements these rules exactly, with no manual override
