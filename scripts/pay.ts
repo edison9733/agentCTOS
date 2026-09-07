@@ -142,14 +142,29 @@ async function main() {
   kv("buyer", buyer.publicKey.toBase58());
 
   // ---------------------------------------------------------------- token
-  step(1, "Mint a demo SPL token and fund the buyer");
-  const mint = await createMint(
-    provider.connection,
-    buyer,
-    provider.wallet.publicKey,
-    null,
-    DECIMALS
-  );
+  //
+  // A merchant pins its settlement mint at registration, so reusing one with
+  // --merchant has to reuse that same mint too — minting a fresh token each
+  // run would be rejected with MintMismatch. The wallet is the mint authority
+  // for any mint this script created, so it can top itself up either way.
+  let mint: PublicKey;
+  if (merchantOwnerArg) {
+    const existing: any = await program.account.merchant.fetch(
+      merchantPda(new PublicKey(merchantOwnerArg))
+    );
+    mint = existing.mint;
+    step(1, "Reuse the merchant's registered settlement mint");
+  } else {
+    step(1, "Mint a demo SPL token and fund the buyer");
+    mint = await createMint(
+      provider.connection,
+      buyer,
+      provider.wallet.publicKey,
+      null,
+      DECIMALS
+    );
+  }
+
   const buyerToken = await createAccount(
     provider.connection,
     buyer,
