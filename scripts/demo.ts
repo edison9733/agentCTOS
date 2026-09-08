@@ -91,7 +91,21 @@ async function main() {
 
   const program = loadProgram(provider);
   const rpcUrl = provider.connection.rpcEndpoint;
-  const buyer = (provider.wallet as anchor.Wallet).payer;
+  // `payer` is the user's own persistent, funded wallet — used only to fund
+  // and mint for everyone else. `buyer` is a fresh identity every run, same
+  // as the merchants below: BuyerStanding is keyed only by buyer pubkey, so
+  // reusing a persistent wallet there would make register_buyer collide on
+  // a second run, and would make Act 2's "zero orders settled" claim false
+  // the moment it wasn't actually a first run.
+  const payer = (provider.wallet as anchor.Wallet).payer;
+  const buyer = Keypair.generate();
+  const fundSol = async (dest: PublicKey, lamports: number) => {
+    const tx = new anchor.web3.Transaction().add(
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: dest, lamports })
+    );
+    await provider.sendAndConfirm(tx);
+  };
+  await fundSol(buyer.publicKey, 100_000_000);
 
   const links: string[] = [];
   const record = (label: string, sig: string) =>
@@ -124,28 +138,22 @@ async function main() {
   console.log(` Program   ${program.programId.toBase58()}`);
   console.log(` Buyer     ${buyer.publicKey.toBase58()}`);
 
-  const mint = await createMint(provider.connection, buyer, provider.wallet.publicKey, null, DECIMALS);
-  const buyerToken = await createAccount(provider.connection, buyer, mint, buyer.publicKey, Keypair.generate());
-  await mintTo(provider.connection, buyer, mint, buyerToken, provider.wallet.publicKey, BigInt(unit(1_000).toString()));
+  const mint = await createMint(provider.connection, payer, provider.wallet.publicKey, null, DECIMALS);
+  const buyerToken = await createAccount(provider.connection, payer, mint, buyer.publicKey, Keypair.generate());
+  await mintTo(provider.connection, payer, mint, buyerToken, provider.wallet.publicKey, BigInt(unit(1_000).toString()));
   console.log(` Token     ${mint.toBase58()} (6 decimals, 1,000 minted to buyer)`);
 
-  const treasuryToken = await createAccount(provider.connection, buyer, mint, TREASURY, Keypair.generate());
+  const treasuryToken = await createAccount(provider.connection, payer, mint, TREASURY, Keypair.generate());
 
   const honest = Keypair.generate();
   const rugger = Keypair.generate();
-  const fundSol = async (dest: PublicKey, lamports: number) => {
-    const tx = new anchor.web3.Transaction().add(
-      SystemProgram.transfer({ fromPubkey: buyer.publicKey, toPubkey: dest, lamports })
-    );
-    await provider.sendAndConfirm(tx);
-  };
   // open_reserve/post_reserve have the merchant pay its own PDA rent, unlike
-  // everything else in this demo where buyer covers the fees — fund both
-  // generated merchants with real lamports before either signs anything.
+  // everything else in this demo where the persistent wallet covers fees —
+  // fund both generated merchants with real lamports before either signs.
   await fundSol(honest.publicKey, 20_000_000);
   await fundSol(rugger.publicKey, 20_000_000);
-  const honestToken = await createAccount(provider.connection, buyer, mint, honest.publicKey, Keypair.generate());
-  const ruggerToken = await createAccount(provider.connection, buyer, mint, rugger.publicKey, Keypair.generate());
+  const honestToken = await createAccount(provider.connection, payer, mint, honest.publicKey, Keypair.generate());
+  const ruggerToken = await createAccount(provider.connection, payer, mint, rugger.publicKey, Keypair.generate());
 
   const payFor = async (merchant: PublicKey, merchantToken: PublicKey, amount: BN, orderId: BN, timeout: number) => {
     const payment = paymentPda(merchant, orderId);
@@ -193,8 +201,8 @@ async function main() {
     .rpc();
   record("open_reserve(honest)", openSig);
 
-  const merchantFunding = await createAccount(provider.connection, buyer, mint, honest.publicKey, Keypair.generate());
-  await mintTo(provider.connection, buyer, mint, merchantFunding, provider.wallet.publicKey, BigInt(unit(100).toString()));
+  const merchantFunding = await createAccount(provider.connection, payer, mint, honest.publicKey, Keypair.generate());
+  await mintTo(provider.connection, payer, mint, merchantFunding, provider.wallet.publicKey, BigInt(unit(100).toString()));
   const postSig = await program.methods
     .postReserve(unit(100))
     .accounts({
@@ -290,8 +298,8 @@ async function main() {
     })
     .signers([rugger])
     .rpc();
-  const ruggerFunding = await createAccount(provider.connection, buyer, mint, rugger.publicKey, Keypair.generate());
-  await mintTo(provider.connection, buyer, mint, ruggerFunding, provider.wallet.publicKey, BigInt(unit(40).toString()));
+  const ruggerFunding = await createAccount(provider.connection, payer, mint, rugger.publicKey, Keypair.generate());
+  await mintTo(provider.connection, payer, mint, ruggerFunding, provider.wallet.publicKey, BigInt(unit(40).toString()));
   await program.methods
     .postReserve(unit(40))
     .accounts({
