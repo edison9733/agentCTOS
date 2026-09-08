@@ -133,6 +133,17 @@ async function main() {
 
   const honest = Keypair.generate();
   const rugger = Keypair.generate();
+  const fundSol = async (dest: PublicKey, lamports: number) => {
+    const tx = new anchor.web3.Transaction().add(
+      SystemProgram.transfer({ fromPubkey: buyer.publicKey, toPubkey: dest, lamports })
+    );
+    await provider.sendAndConfirm(tx);
+  };
+  // open_reserve/post_reserve have the merchant pay its own PDA rent, unlike
+  // everything else in this demo where buyer covers the fees — fund both
+  // generated merchants with real lamports before either signs anything.
+  await fundSol(honest.publicKey, 20_000_000);
+  await fundSol(rugger.publicKey, 20_000_000);
   const honestToken = await createAccount(provider.connection, buyer, mint, honest.publicKey, Keypair.generate());
   const ruggerToken = await createAccount(provider.connection, buyer, mint, rugger.publicKey, Keypair.generate());
 

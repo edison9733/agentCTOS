@@ -163,8 +163,13 @@ async function main() {
     mint = await createMint(provider.connection, buyer, provider.wallet.publicKey, null, DECIMALS);
     merchantKey = Keypair.generate();
     merchant = merchantKey.publicKey;
-    const sig = await provider.connection.requestAirdrop(merchant, 0.05e9);
-    await provider.connection.confirmTransaction(sig);
+    // open_reserve/post_reserve have the merchant pay its own PDA rent, so it
+    // needs real lamports — transfer from the already-funded buyer rather
+    // than requestAirdrop, which devnet rate-limits aggressively.
+    const fundTx = new anchor.web3.Transaction().add(
+      SystemProgram.transfer({ fromPubkey: buyer.publicKey, toPubkey: merchant, lamports: 20_000_000 })
+    );
+    await provider.sendAndConfirm(fundTx);
   }
 
   const buyerToken = merchantArg
