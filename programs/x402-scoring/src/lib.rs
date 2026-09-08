@@ -963,7 +963,7 @@ pub struct InitiatePayment<'info> {
     /// `initiate_payment`'s body — because a merchant is not required to
     /// have opened a reserve to receive payment at all, only to be eligible
     /// for the instant portion.
-    #[account(seeds = [b"reserve", merchant.key().as_ref()], bump)]
+    #[account(mut, seeds = [b"reserve", merchant.key().as_ref()], bump)]
     pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: the reserve's vault, only read when `merchant_reserve` exists.
@@ -1017,11 +1017,11 @@ pub struct ConfirmDelivery<'info> {
 
     /// CHECK: only touched if `payment.instant_amount > 0`, in which case it
     /// is guaranteed to already exist.
-    #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
+    #[account(mut, seeds = [b"reserve", payment.merchant.as_ref()], bump)]
     pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: only touched if it already exists — see `register_buyer`.
-    #[account(seeds = [b"standing", buyer.key().as_ref()], bump)]
+    #[account(mut, seeds = [b"standing", buyer.key().as_ref()], bump)]
     pub buyer_standing: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -1095,11 +1095,11 @@ pub struct FinalizeClaim<'info> {
     pub treasury_token: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: only touched if `payment.instant_amount > 0`.
-    #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
+    #[account(mut, seeds = [b"reserve", payment.merchant.as_ref()], bump)]
     pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: only touched if it already exists.
-    #[account(seeds = [b"standing", payment.buyer.as_ref()], bump)]
+    #[account(mut, seeds = [b"standing", payment.buyer.as_ref()], bump)]
     pub buyer_standing: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
