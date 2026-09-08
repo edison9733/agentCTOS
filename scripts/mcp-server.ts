@@ -98,6 +98,29 @@ const reserveVaultPda = (reserve: PublicKey) =>
 const standingPda = (buyer: PublicKey) =>
   PublicKey.findProgramAddressSync([Buffer.from("standing"), buyer.toBuffer()], program.programId)[0];
 
+// RPC endpoints carry a provider API key — Helius and Ankr in the query
+// string, Alchemy and QuickNode in the path. Never print the endpoint raw:
+// this banner goes to stderr, which an MCP client surfaces in its logs.
+function redactRpc(url: string): string {
+  let out = url.replace(
+    /([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*/gi,
+    "$1REDACTED"
+  );
+  try {
+    const u = new URL(out);
+    const segments = u.pathname.split("/").filter(Boolean);
+    const last = segments[segments.length - 1];
+    if (last && /^[A-Za-z0-9_-]{16,}$/.test(last)) {
+      segments[segments.length - 1] = "REDACTED";
+      u.pathname = `/${segments.join("/")}`;
+      out = u.toString();
+    }
+  } catch {
+    // Not a parseable URL; the query-string pass above still applied.
+  }
+  return out;
+}
+
 function explorer(kind: "tx" | "address", id: string): string {
   const base = `https://explorer.solana.com/${kind}/${id}`;
   if (rpcUrl.includes("devnet")) return `${base}?cluster=devnet`;
@@ -413,7 +436,7 @@ server.registerTool(
 
 async function main() {
   console.error(
-    `x402-escrow MCP server — program ${program.programId.toBase58()} on ${rpcUrl}, wallet ${wallet.publicKey.toBase58()}`
+    `x402-escrow MCP server — program ${program.programId.toBase58()} on ${redactRpc(rpcUrl)}, wallet ${wallet.publicKey.toBase58()}`
   );
   await server.connect(new StdioServerTransport());
 }

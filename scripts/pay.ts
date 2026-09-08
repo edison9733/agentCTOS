@@ -153,6 +153,28 @@ function flag(name: string): boolean {
   return process.argv.includes(`--${name}`);
 }
 
+// RPC endpoints carry a provider API key — Helius and Ankr in the query
+// string, Alchemy and QuickNode in the path. Never print the endpoint raw.
+function redactRpc(url: string): string {
+  let out = url.replace(
+    /([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*/gi,
+    "$1REDACTED"
+  );
+  try {
+    const u = new URL(out);
+    const segments = u.pathname.split("/").filter(Boolean);
+    const last = segments[segments.length - 1];
+    if (last && /^[A-Za-z0-9_-]{16,}$/.test(last)) {
+      segments[segments.length - 1] = "REDACTED";
+      u.pathname = `/${segments.join("/")}`;
+      out = u.toString();
+    }
+  } catch {
+    // Not a parseable URL; the query-string pass above still applied.
+  }
+  return out;
+}
+
 function explorer(kind: "tx" | "address", id: string, rpcUrl: string): string {
   const base = `https://explorer.solana.com/${kind}/${id}`;
   if (rpcUrl.includes("devnet")) return `${base}?cluster=devnet`;
@@ -240,7 +262,7 @@ async function main() {
   console.log("=".repeat(72));
   console.log(" x402 ESCROWED PAYMENT — ROUTED BY COLLATERAL");
   console.log("=".repeat(72));
-  kv("network", rpcUrl);
+  kv("network", redactRpc(rpcUrl));
   kv("program", program.programId.toBase58());
   kv("buyer", buyer.publicKey.toBase58());
 

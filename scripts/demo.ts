@@ -150,6 +150,29 @@ const mintTo: typeof rawMintTo = async (...args) => {
 // Nesting a second retry around it would only stack backoffs.
 const getAccount = rawGetAccount;
 
+// RPC endpoints carry a provider API key — Helius and Ankr in the query
+// string, Alchemy and QuickNode in the path. This demo is meant to be run on a
+// shared screen and tee'd to a file, so the endpoint is never printed raw.
+function redactRpc(url: string): string {
+  let out = url.replace(
+    /([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*/gi,
+    "$1REDACTED"
+  );
+  try {
+    const u = new URL(out);
+    const segments = u.pathname.split("/").filter(Boolean);
+    const last = segments[segments.length - 1];
+    if (last && /^[A-Za-z0-9_-]{16,}$/.test(last)) {
+      segments[segments.length - 1] = "REDACTED";
+      u.pathname = `/${segments.join("/")}`;
+      out = u.toString();
+    }
+  } catch {
+    // Not a parseable URL; the query-string pass above still applied.
+  }
+  return out;
+}
+
 function explorer(kind: "tx" | "address", id: string, rpcUrl: string): string {
   const base = `https://explorer.solana.com/${kind}/${id}`;
   if (rpcUrl.includes("devnet")) return `${base}?cluster=devnet`;
@@ -233,7 +256,7 @@ async function main() {
   console.log(" AGENT CTOS — x402 ESCROW, ROUTED BY COLLATERAL");
   console.log(" Extraction is bounded by posted collateral, not by knowing who anyone is.");
   console.log("=".repeat(72));
-  console.log(` Network   ${rpcUrl}`);
+  console.log(` Network   ${redactRpc(rpcUrl)}`);
   console.log(` Program   ${program.programId.toBase58()}`);
   console.log(` Buyer     ${buyer.publicKey.toBase58()}`);
 
