@@ -113,6 +113,14 @@ returns its rent. Indexers read the events; nothing verifiable is lost.
   rejected by the runtime rather than by a check.
 - **`confirm_delivery(order_id)`** — buyer-signed; pays the merchant the order
   amount less the settlement fee, and closes the vault.
+- **`batch_confirm_delivery()`** — settles up to 8 orders in one transaction
+  instead of one `confirm_delivery` per order. Takes no typed accounts of its
+  own; every four consecutive entries in the transaction's remaining accounts
+  are one order's `[payment, escrow_vault, merchant_token, treasury_token]`.
+  All orders in one call must share the same buyer, since the transaction
+  carries only that one signature. Same rule, same helpers as
+  `confirm_delivery` — this only amortizes the network fee and confirmation
+  wait across many orders.
 - **`refund_escrow(order_id)`** — buyer- **and** merchant-signed; returns the
   full amount to the buyer with no fee.
 - **`reclaim_timeout(order_id)`** — buyer-signed, only after `expiry`; returns
@@ -210,6 +218,7 @@ buffer, and `solana program extend` when an upgraded binary no longer fits.
 | `InvalidTreasury` | fee destination is not the compiled-in treasury |
 | `PaymentStillOpen` | tried to close a record whose escrow is still held |
 | `ArithmeticOverflow` | checked math guard tripped |
+| `InvalidBatchSize` | `batch_confirm_delivery`'s remaining accounts weren't a multiple of 4, or exceeded 8 orders |
 
 ## What this does not do
 

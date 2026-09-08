@@ -50,6 +50,17 @@ pub const TREASURY: Pubkey = pubkey!("5i7zzV9hQUCbpg8MXSNJB3QQkL6zscDd8VQKow46vg
 const MIN_TIMEOUT_SECONDS: i64 = 60;
 const MAX_TIMEOUT_SECONDS: i64 = 30 * 24 * 60 * 60; // 30 days
 
+/// `batch_confirm_delivery` reads its orders from `remaining_accounts` in
+/// groups of this many: `[payment, escrow_vault, merchant_token,
+/// treasury_token]`, in that order.
+const ACCOUNTS_PER_BATCH_ORDER: usize = 4;
+
+/// Caps a batch well inside Solana's legacy transaction account limit
+/// (~35 accounts). At 4 accounts/order plus the buyer and token_program
+/// shared across the whole batch, 8 orders comfortably fits one transaction;
+/// a client wanting more needs an Address Lookup Table.
+const MAX_BATCH_SIZE: usize = 8;
+
 #[program]
 pub mod x402_scoring {
     use super::*;
@@ -154,6 +165,124 @@ pub mod x402_scoring {
             fee,
             outcome: PaymentStatus::Settled,
         });
+        Ok(())
+    }
+
+    /// Settles up to `MAX_BATCH_SIZE` orders in one transaction, instead of
+    /// one `confirm_delivery` transaction per order.
+    ///
+    /// Same rule as `confirm_delivery` — the buyer signs, the merchant is
+    /// paid, the fee is charged — just applied to a whole list of orders at
+    /// once. Every four consecutive accounts in `remaining_accounts` are one
+    /// order's `[payment, escrow_vault, merchant_token, treasury_token]`.
+    /// All orders in one call must belong to this same buyer, since a
+    /// transaction carries only the one signature.
+    ///
+    /// This exists purely to amortize Solana's per-transaction signature fee
+    /// and confirmation wait across many orders — it changes nothing about
+    /// custody or the settlement rule itself, and reuses the exact same
+    /// `release`/`take_fee` helpers `confirm_delivery` uses one order at a
+    /// time.
+    pub fn batch_confirm_delivery(ctx: Context<BatchConfirmDelivery>) -> Result<()> {
+        let remaining = ctx.remaining_accounts;
+        require!(!remaining.is_empty(), ErrorCode::InvalidBatchSize);
+        require!(
+            remaining.len() % ACCOUNTS_PER_BATCH_ORDER == 0,
+            ErrorCode::InvalidBatchSize
+        );
+        let order_count = remaining.len() / ACCOUNTS_PER_BATCH_ORDER;
+        require!(order_count <= MAX_BATCH_SIZE, ErrorCode::InvalidBatchSize);
+
+        let buyer_key = ctx.accounts.buyer.key();
+
+        for i in 0..order_count {
+            let base = i * ACCOUNTS_PER_BATCH_ORDER;
+            let payment_info = &remaining[base];
+            let vault_info = &remaining[base + 1];
+            let merchant_token_info = &remaining[base + 2];
+            let treasury_token_info = &remaining[base + 3];
+
+            // Same checks `#[account(seeds = ..., bump = payment.bump)]` runs
+            // for a single typed account, written by hand because this
+            // account's position in the account list is dynamic.
+            let mut payment: Account<Payment> = Account::try_from(payment_info)?;
+            require!(payment.buyer == buyer_key, ErrorCode::InvalidBuyer);
+            require!(
+                payment.status == PaymentStatus::EscrowHeld,
+                ErrorCode::InvalidPaymentStatus
+            );
+            let expected_payment = Pubkey::create_program_address(
+                &[
+                    b"payment",
+                    buyer_key.as_ref(),
+                    payment.merchant.as_ref(),
+                    &payment.order_id.to_le_bytes(),
+                    &[payment.bump],
+                ],
+                ctx.program_id,
+            )
+            .map_err(|_| error!(ErrorCode::InvalidOrder))?;
+            require!(
+                expected_payment == payment_info.key(),
+                ErrorCode::InvalidOrder
+            );
+
+            let vault: Account<TokenAccount> = Account::try_from(vault_info)?;
+            let expected_vault = Pubkey::create_program_address(
+                &[b"vault", payment_info.key().as_ref(), &[payment.vault_bump]],
+                ctx.program_id,
+            )
+            .map_err(|_| error!(ErrorCode::InvalidOrder))?;
+            require!(expected_vault == vault_info.key(), ErrorCode::InvalidOrder);
+
+            let merchant_token: Account<TokenAccount> = Account::try_from(merchant_token_info)?;
+            require!(
+                merchant_token.owner == payment.merchant,
+                ErrorCode::InvalidTokenOwner
+            );
+            require!(merchant_token.mint == payment.mint, ErrorCode::InvalidMint);
+
+            let treasury_token: Account<TokenAccount> = Account::try_from(treasury_token_info)?;
+            require!(treasury_token.owner == TREASURY, ErrorCode::InvalidTreasury);
+            require!(treasury_token.mint == payment.mint, ErrorCode::InvalidMint);
+
+            let amount = payment.amount;
+            let fee = settlement_fee(amount)?;
+            let to_merchant = amount.checked_sub(fee).ok_or(ErrorCode::ArithmeticOverflow)?;
+            let order_id = payment.order_id;
+
+            take_fee(
+                &ctx.accounts.token_program,
+                &vault,
+                &treasury_token,
+                &payment,
+                fee,
+                order_id,
+            )?;
+            release(
+                &ctx.accounts.token_program,
+                &vault,
+                &merchant_token,
+                &payment,
+                ctx.accounts.buyer.to_account_info(),
+                to_merchant,
+                order_id,
+            )?;
+
+            payment.status = PaymentStatus::Settled;
+            payment.fee_amount = fee;
+            payment.exit(ctx.program_id)?;
+
+            emit!(PaymentSettled {
+                buyer: payment.buyer,
+                merchant: payment.merchant,
+                order_id,
+                amount,
+                fee,
+                outcome: PaymentStatus::Settled,
+            });
+        }
+
         Ok(())
     }
 
@@ -503,6 +632,17 @@ pub struct ConfirmDelivery<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+/// Fixed accounts for `batch_confirm_delivery`. Everything order-specific
+/// arrives via `ctx.remaining_accounts` instead — see that function's doc
+/// comment for the per-order account layout.
+#[derive(Accounts)]
+pub struct BatchConfirmDelivery<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 #[derive(Accounts)]
 #[instruction(order_id: u64)]
 pub struct RefundEscrow<'info> {
@@ -610,4 +750,6 @@ pub enum ErrorCode {
     PaymentStillOpen,
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[msg("Batch must contain 1 to MAX_BATCH_SIZE orders' worth of accounts, 4 per order")]
+    InvalidBatchSize,
 }

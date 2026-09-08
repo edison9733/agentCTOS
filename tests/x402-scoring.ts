@@ -374,6 +374,110 @@ describe("x402 escrow", () => {
     );
   });
 
+  it("batch_confirm_delivery settles multiple orders in one transaction", async () => {
+    const { owner: owner1, token: token1 } = await newMerchant();
+    const { owner: owner2, token: token2 } = await newMerchant();
+    const buyerToken = await fundedBuyerToken(unit(200));
+
+    const orderId1 = new BN(10);
+    const orderId2 = new BN(11);
+    const { payment: payment1, vault: vault1 } = await pay(
+      owner1.publicKey,
+      buyerToken,
+      unit(30),
+      orderId1
+    );
+    const { payment: payment2, vault: vault2 } = await pay(
+      owner2.publicKey,
+      buyerToken,
+      unit(50),
+      orderId2
+    );
+
+    const treasuryBefore = (await getAccount(provider.connection, treasuryToken)).amount;
+
+    await program.methods
+      .batchConfirmDelivery()
+      .accounts({
+        buyer: buyer.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .remainingAccounts([
+        { pubkey: payment1, isWritable: true, isSigner: false },
+        { pubkey: vault1, isWritable: true, isSigner: false },
+        { pubkey: token1, isWritable: true, isSigner: false },
+        { pubkey: treasuryToken, isWritable: true, isSigner: false },
+        { pubkey: payment2, isWritable: true, isSigner: false },
+        { pubkey: vault2, isWritable: true, isSigner: false },
+        { pubkey: token2, isWritable: true, isSigner: false },
+        { pubkey: treasuryToken, isWritable: true, isSigner: false },
+      ])
+      .signers([buyer])
+      .rpc();
+
+    const fee1 = unit(30).muln(FEE_BPS).divn(10_000);
+    const fee2 = unit(50).muln(FEE_BPS).divn(10_000);
+
+    const p1 = await program.account.payment.fetch(payment1);
+    const p2 = await program.account.payment.fetch(payment2);
+    assert.deepEqual(p1.status, { settled: {} });
+    assert.deepEqual(p2.status, { settled: {} });
+    assert.equal(p1.feeAmount.toString(), fee1.toString());
+    assert.equal(p2.feeAmount.toString(), fee2.toString());
+
+    assert.equal(
+      (await getAccount(provider.connection, token1)).amount.toString(),
+      unit(30).sub(fee1).toString(),
+      "merchant 1 receives their order minus its fee"
+    );
+    assert.equal(
+      (await getAccount(provider.connection, token2)).amount.toString(),
+      unit(50).sub(fee2).toString(),
+      "merchant 2 receives their order minus its fee"
+    );
+
+    const treasuryAfter = (await getAccount(provider.connection, treasuryToken)).amount;
+    assert.equal(
+      (treasuryAfter - treasuryBefore).toString(),
+      fee1.add(fee2).toString(),
+      "the treasury collects both orders' fees from the one batched transaction"
+    );
+
+    // Both vaults close once emptied, exactly as a single confirm_delivery would.
+    assert.equal(await provider.connection.getAccountInfo(vault1), null);
+    assert.equal(await provider.connection.getAccountInfo(vault2), null);
+  });
+
+  it("rejects a batch whose account count is not a multiple of 4", async () => {
+    const { owner, token } = await newMerchant();
+    const buyerToken = await fundedBuyerToken(unit(100));
+    const orderId = new BN(12);
+    const { payment, vault } = await pay(owner.publicKey, buyerToken, unit(20), orderId);
+
+    try {
+      await program.methods
+        .batchConfirmDelivery()
+        .accounts({
+          buyer: buyer.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .remainingAccounts([
+          { pubkey: payment, isWritable: true, isSigner: false },
+          { pubkey: vault, isWritable: true, isSigner: false },
+          { pubkey: token, isWritable: true, isSigner: false },
+          // treasuryToken deliberately omitted: 3 accounts, not a multiple of 4.
+        ])
+        .signers([buyer])
+        .rpc();
+      assert.fail("expected a non-multiple-of-4 batch to be rejected");
+    } catch (err) {
+      assert.ok(
+        String(err).includes("InvalidBatchSize"),
+        `expected InvalidBatchSize, got: ${err}`
+      );
+    }
+  });
+
   it("after the timeout the buyer recovers the escrow alone", async () => {
     const { owner, token } = await newMerchant();
     const buyerToken = await fundedBuyerToken(unit(100));
