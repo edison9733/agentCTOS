@@ -9,6 +9,7 @@
     "deploy": "anchor deploy",
     "demo": "npx ts-node scripts/demo.ts",
     "pay": "npx ts-node scripts/pay.ts",
+    "carpool": "npx ts-node scripts/carpool.ts",
     "mcp": "npx ts-node scripts/mcp-server.ts"
   },
   "keywords": [

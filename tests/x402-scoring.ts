@@ -70,6 +70,40 @@ describe("x402 escrow", () => {
       program.programId
     )[0];
 
+  const pooledPaymentPda = (coordinator: PublicKey, merchant: PublicKey, orderId: BN) =>
+    PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("pooled_payment"),
+        coordinator.toBuffer(),
+        merchant.toBuffer(),
+        orderId.toArrayLike(Buffer, "le", 8),
+      ],
+      program.programId
+    )[0];
+
+  const pooledVaultPda = (payment: PublicKey) =>
+    PublicKey.findProgramAddressSync(
+      [Buffer.from("pooled_vault"), payment.toBuffer()],
+      program.programId
+    )[0];
+
+  /** A funded contributor: a fresh keypair with SOL for rent, and a token
+   *  account holding exactly `amount`. */
+  async function fundedContributor(amount: BN): Promise<{ keypair: Keypair; token: PublicKey }> {
+    const keypair = Keypair.generate();
+    const sig = await provider.connection.requestAirdrop(keypair.publicKey, LAMPORTS_PER_SOL / 10);
+    await provider.connection.confirmTransaction(sig);
+    const token = await createAccount(
+      provider.connection,
+      payerWallet,
+      mint,
+      keypair.publicKey,
+      Keypair.generate()
+    );
+    await mintTo(provider.connection, payerWallet, mint, token, provider.wallet.publicKey, BigInt(amount.toString()));
+    return { keypair, token };
+  }
+
   before(async () => {
     const sig = await provider.connection.requestAirdrop(buyer.publicKey, 2 * LAMPORTS_PER_SOL);
     await provider.connection.confirmTransaction(sig);
@@ -509,5 +543,138 @@ describe("x402 escrow", () => {
     assert.equal((await getAccount(provider.connection, token)).amount.toString(), "0");
     // The vault is closed once emptied.
     assert.equal(await provider.connection.getAccountInfo(vaultPda(payment)), null);
+  }).timeout(150_000);
+
+  it("initiate_pooled_payment merges two buyers into one escrowed order", async () => {
+    const { owner, token } = await newMerchant();
+    const a = await fundedContributor(unit(30));
+    const b = await fundedContributor(unit(70));
+
+    const orderId = new BN(20);
+    const payment = pooledPaymentPda(a.keypair.publicKey, owner.publicKey, orderId);
+    const vault = pooledVaultPda(payment);
+
+    await program.methods
+      .initiatePooledPayment(orderId, new BN(3600), [unit(30), unit(70)])
+      .accounts({
+        payment,
+        merchant: owner.publicKey,
+        coordinator: a.keypair.publicKey,
+        escrowVault: vault,
+        mint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .remainingAccounts([
+        { pubkey: a.keypair.publicKey, isWritable: false, isSigner: true },
+        { pubkey: a.token, isWritable: true, isSigner: false },
+        { pubkey: b.keypair.publicKey, isWritable: false, isSigner: true },
+        { pubkey: b.token, isWritable: true, isSigner: false },
+      ])
+      .signers([a.keypair, b.keypair])
+      .rpc();
+
+    const p: any = await program.account.pooledPayment.fetch(payment);
+    assert.equal(p.amount.toString(), unit(100).toString());
+    assert.equal(p.contributorCount, 2);
+    assert.equal(p.coordinator.toBase58(), a.keypair.publicKey.toBase58());
+    assert.equal((await getAccount(provider.connection, vault)).amount.toString(), unit(100).toString());
+    assert.equal((await getAccount(provider.connection, a.token)).amount.toString(), "0");
+    assert.equal((await getAccount(provider.connection, b.token)).amount.toString(), "0");
+
+    const treasuryBefore = (await getAccount(provider.connection, treasuryToken)).amount;
+    await program.methods
+      .confirmPooledDelivery(orderId)
+      .accounts({
+        payment,
+        coordinator: a.keypair.publicKey,
+        escrowVault: vault,
+        merchantToken: token,
+        treasuryToken,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([a.keypair])
+      .rpc();
+
+    const fee = unit(100).muln(FEE_BPS).divn(10_000);
+    const p2: any = await program.account.pooledPayment.fetch(payment);
+    assert.deepEqual(p2.status, { settled: {} });
+    assert.equal(
+      (await getAccount(provider.connection, token)).amount.toString(),
+      unit(100).sub(fee).toString(),
+      "the merchant receives the pooled order minus the settlement fee"
+    );
+    assert.equal(
+      ((await getAccount(provider.connection, treasuryToken)).amount - treasuryBefore).toString(),
+      fee.toString()
+    );
+    assert.equal(await provider.connection.getAccountInfo(vault), null);
+  });
+
+  it("reclaim_pooled_timeout refunds each contributor their own amount, with no signer required", async () => {
+    const { owner } = await newMerchant();
+    const a = await fundedContributor(unit(15));
+    const b = await fundedContributor(unit(25));
+
+    const orderId = new BN(21);
+    const payment = pooledPaymentPda(a.keypair.publicKey, owner.publicKey, orderId);
+    const vault = pooledVaultPda(payment);
+
+    // 61s is the shortest timeout the program allows; the wait below is real.
+    await program.methods
+      .initiatePooledPayment(orderId, new BN(61), [unit(15), unit(25)])
+      .accounts({
+        payment,
+        merchant: owner.publicKey,
+        coordinator: a.keypair.publicKey,
+        escrowVault: vault,
+        mint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .remainingAccounts([
+        { pubkey: a.keypair.publicKey, isWritable: false, isSigner: true },
+        { pubkey: a.token, isWritable: true, isSigner: false },
+        { pubkey: b.keypair.publicKey, isWritable: false, isSigner: true },
+        { pubkey: b.token, isWritable: true, isSigner: false },
+      ])
+      .signers([a.keypair, b.keypair])
+      .rpc();
+
+    await new Promise((r) => setTimeout(r, 62_000));
+
+    // No .signers() at all — reclaim_pooled_timeout takes no signer, only
+    // the clock, and the default provider wallet pays for this transaction
+    // despite not being a contributor itself.
+    await program.methods
+      .reclaimPooledTimeout(orderId)
+      .accounts({
+        payment,
+        coordinator: a.keypair.publicKey,
+        escrowVault: vault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .remainingAccounts([
+        { pubkey: a.token, isWritable: true, isSigner: false },
+        { pubkey: b.token, isWritable: true, isSigner: false },
+      ])
+      .rpc();
+
+    const p: any = await program.account.pooledPayment.fetch(payment);
+    assert.deepEqual(p.status, { reclaimed: {} });
+    assert.equal(p.feeAmount.toNumber(), 0, "a reclaimed pooled order must not charge a fee");
+    assert.equal(
+      (await getAccount(provider.connection, a.token)).amount.toString(),
+      unit(15).toString(),
+      "contributor A gets back exactly their own contribution"
+    );
+    assert.equal(
+      (await getAccount(provider.connection, b.token)).amount.toString(),
+      unit(25).toString(),
+      "contributor B gets back exactly their own contribution"
+    );
+    assert.equal(await provider.connection.getAccountInfo(vault), null);
   }).timeout(150_000);
 });

@@ -36,9 +36,9 @@ anchor build
 anchor test
 ```
 
-Expect **9 passing**, about two minutes. One test really does sleep 62
-seconds — the program enforces a 60-second minimum escrow timeout and that
-test waits it out rather than faking the clock.
+Expect **13 passing**, about two and a half minutes. Two tests really do
+sleep 62 seconds each — the program enforces a 60-second minimum escrow
+timeout and those tests wait it out rather than faking the clock.
 
 ```bash
 npm run demo 2>&1 | tee demo-output.txt

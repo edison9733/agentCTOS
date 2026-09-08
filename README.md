@@ -22,7 +22,7 @@ is that policy, enforced on-chain.
 | Program ID | `HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4` |
 | Cluster | devnet |
 | Explorer | [view the program](https://explorer.solana.com/address/HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4?cluster=devnet) |
-| Tests | 9 passing |
+| Tests | 13 passing |
 
 ## Quick Start
 
@@ -127,6 +127,27 @@ returns its rent. Indexers read the events; nothing verifiable is lost.
   the full amount to the buyer with no fee.
 - **`close_payment(order_id)`** — buyer-signed; deletes a finished order record
   and refunds its rent. Rejected while the escrow is still held.
+- **`initiate_pooled_payment(order_id, timeout_seconds, amounts)`** — splits
+  one order's cost across up to 4 different buyers ("carpooling"), each
+  paying their own declared share from their own token account within the
+  same transaction. Meant to be assembled off-chain (see
+  `npm run carpool`): a matching service checks each buyer's own price
+  ceiling against their required share before anyone signs, then builds one
+  transaction, collects every contributor's signature, and submits it once
+  — so nothing is negotiated on-chain, and if matching fails or a signature
+  never arrives, no funds ever move. One contributor is recorded as the
+  `coordinator` and plays the role `buyer` plays elsewhere.
+- **`confirm_pooled_delivery(order_id)`** — coordinator-signed; same as
+  `confirm_delivery`, applied to a pooled order.
+- **`refund_pooled_escrow(order_id)`** — coordinator- **and** merchant-signed;
+  refunds every contributor their own recorded amount, no fee.
+- **`reclaim_pooled_timeout(order_id)`** — after `expiry`, refunds every
+  contributor their own amount. Takes **no signer at all**: the clock is
+  the only authorization, and every contributor's own token account can
+  only ever receive that same contributor's own recorded amount back, so
+  anyone can submit this without being trusted with anyone else's money.
+- **`close_pooled_payment(order_id)`** — coordinator-signed; deletes a
+  finished pooled order record and refunds its rent.
 
 ## Accounts
 
@@ -177,15 +198,15 @@ buyer. Point it at a cluster with `ANCHOR_PROVIDER_URL`.
 ```bash
 npm install
 anchor build
-anchor test    # 9 passing, ~2 minutes
+anchor test    # 13 passing, ~2 minutes
 ```
 
 The program ID is committed in `lib.rs` and `Anchor.toml`. Run `anchor keys
 sync` only if you are deploying under a keypair of your own.
 
-One test genuinely sleeps 62 seconds: the program enforces a 60-second minimum
-escrow timeout, and that test waits it out rather than faking the clock. That
-is expected, not a hang.
+Two tests genuinely sleep 62 seconds each: the program enforces a 60-second
+minimum escrow timeout, and those tests wait it out rather than faking the
+clock. That is expected, not a hang.
 
 ## Deployment (devnet)
 
@@ -219,6 +240,8 @@ buffer, and `solana program extend` when an upgraded binary no longer fits.
 | `PaymentStillOpen` | tried to close a record whose escrow is still held |
 | `ArithmeticOverflow` | checked math guard tripped |
 | `InvalidBatchSize` | `batch_confirm_delivery`'s remaining accounts weren't a multiple of 4, or exceeded 8 orders |
+| `InvalidPoolSize` | `initiate_pooled_payment` had 0 or more than 4 contributors, or a mismatched account count |
+| `InvalidCoordinator` | signer is not the coordinator recorded on this pooled payment |
 
 ## What this does not do
 

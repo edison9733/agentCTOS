@@ -61,6 +61,19 @@ const ACCOUNTS_PER_BATCH_ORDER: usize = 4;
 /// a client wanting more needs an Address Lookup Table.
 const MAX_BATCH_SIZE: usize = 8;
 
+/// `initiate_pooled_payment` splits one order's cost across up to this many
+/// distinct contributors, each transferring their own declared share from
+/// their own token account within the same transaction. Meant to be
+/// assembled off-chain: a matching service collects interested buyers,
+/// checks each one's own price ceiling against their required share, and
+/// only builds this transaction once every contributor has already agreed
+/// to sign for their exact amount.
+const MAX_POOL_CONTRIBUTORS: usize = 4;
+
+/// Accounts consumed per contributor in `initiate_pooled_payment`'s
+/// `remaining_accounts`: `[contributor (signer), contributor_token]`.
+const ACCOUNTS_PER_CONTRIBUTION: usize = 2;
+
 #[program]
 pub mod x402_scoring {
     use super::*;
@@ -383,6 +396,257 @@ pub mod x402_scoring {
         require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
         Ok(())
     }
+
+    /// Splits one order's cost across up to `MAX_POOL_CONTRIBUTORS` buyers,
+    /// each paying their own declared share from their own token account in
+    /// this same transaction.
+    ///
+    /// There is no single buyer to name on the resulting record, so
+    /// `PooledPayment` tracks a `coordinator` instead — one of the
+    /// contributors, playing the same role `buyer` plays on a normal
+    /// `Payment` for later settlement — plus every contributor's own
+    /// address and amount, so a refund or reclaim can pay each of them back
+    /// individually rather than handing everyone's money to one party.
+    pub fn initiate_pooled_payment(
+        ctx: Context<InitiatePooledPayment>,
+        order_id: u64,
+        timeout_seconds: i64,
+        amounts: Vec<u64>,
+    ) -> Result<()> {
+        require!(
+            (MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&timeout_seconds),
+            ErrorCode::InvalidTimeout
+        );
+        let contributor_count = amounts.len();
+        require!(contributor_count > 0, ErrorCode::InvalidPoolSize);
+        require!(
+            contributor_count <= MAX_POOL_CONTRIBUTORS,
+            ErrorCode::InvalidPoolSize
+        );
+        require!(
+            ctx.remaining_accounts.len() == contributor_count * ACCOUNTS_PER_CONTRIBUTION,
+            ErrorCode::InvalidPoolSize
+        );
+
+        let mint_key = ctx.accounts.mint.key();
+        let mut contributors = [Pubkey::default(); MAX_POOL_CONTRIBUTORS];
+        let mut contributor_amounts = [0u64; MAX_POOL_CONTRIBUTORS];
+        let mut total: u64 = 0;
+
+        for i in 0..contributor_count {
+            let amount = amounts[i];
+            require!(amount > 0, ErrorCode::InvalidAmount);
+
+            let base = i * ACCOUNTS_PER_CONTRIBUTION;
+            let contributor_info = &ctx.remaining_accounts[base];
+            let contributor_token_info = &ctx.remaining_accounts[base + 1];
+
+            // Each contributor authorizes their own transfer by co-signing
+            // this transaction; the SPL token CPI below would fail anyway
+            // if this were false, but checking it directly gives a clear
+            // error instead of an opaque CPI failure.
+            require!(contributor_info.is_signer, ErrorCode::InvalidBuyer);
+
+            let contributor_token: Account<TokenAccount> =
+                Account::try_from(contributor_token_info)?;
+            require!(
+                contributor_token.owner == contributor_info.key(),
+                ErrorCode::InvalidTokenOwner
+            );
+            require!(contributor_token.mint == mint_key, ErrorCode::InvalidMint);
+
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: contributor_token_info.clone(),
+                        to: ctx.accounts.escrow_vault.to_account_info(),
+                        authority: contributor_info.clone(),
+                    },
+                ),
+                amount,
+            )?;
+
+            contributors[i] = contributor_info.key();
+            contributor_amounts[i] = amount;
+            total = total
+                .checked_add(amount)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+        }
+
+        let now = Clock::get()?.unix_timestamp;
+        let payment = &mut ctx.accounts.payment;
+        payment.coordinator = ctx.accounts.coordinator.key();
+        payment.merchant = ctx.accounts.merchant.key();
+        payment.mint = mint_key;
+        payment.order_id = order_id;
+        payment.amount = total;
+        payment.fee_amount = 0;
+        payment.status = PaymentStatus::EscrowHeld;
+        payment.created_at = now;
+        payment.expiry = now
+            .checked_add(timeout_seconds)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        payment.bump = ctx.bumps.payment;
+        payment.vault_bump = ctx.bumps.escrow_vault;
+        payment.contributor_count = contributor_count as u8;
+        payment.contributors = contributors;
+        payment.contributor_amounts = contributor_amounts;
+
+        emit!(PooledPaymentInitiated {
+            coordinator: payment.coordinator,
+            merchant: payment.merchant,
+            mint: payment.mint,
+            order_id,
+            amount: total,
+            contributor_count: payment.contributor_count,
+            expiry: payment.expiry,
+        });
+        Ok(())
+    }
+
+    /// The coordinator confirms the pooled order arrived. Releases the
+    /// escrow to the merchant exactly like `confirm_delivery` — a merchant
+    /// payout does not care how many people funded the vault, only that it
+    /// holds the full amount.
+    pub fn confirm_pooled_delivery(
+        ctx: Context<ConfirmPooledDelivery>,
+        order_id: u64,
+    ) -> Result<()> {
+        let payment = &ctx.accounts.payment;
+        require!(
+            payment.status == PaymentStatus::EscrowHeld,
+            ErrorCode::InvalidPaymentStatus
+        );
+        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+
+        let amount = payment.amount;
+        let fee = settlement_fee(amount)?;
+        let to_merchant = amount.checked_sub(fee).ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        take_fee_pooled(
+            &ctx.accounts.token_program,
+            &ctx.accounts.escrow_vault,
+            &ctx.accounts.treasury_token,
+            &ctx.accounts.payment,
+            fee,
+            order_id,
+        )?;
+        release_pooled(
+            &ctx.accounts.token_program,
+            &ctx.accounts.escrow_vault,
+            &ctx.accounts.merchant_token,
+            &ctx.accounts.payment,
+            ctx.accounts.coordinator.to_account_info(),
+            to_merchant,
+            order_id,
+        )?;
+
+        let payment = &mut ctx.accounts.payment;
+        payment.status = PaymentStatus::Settled;
+        payment.fee_amount = fee;
+
+        emit!(PooledPaymentSettled {
+            coordinator: payment.coordinator,
+            merchant: payment.merchant,
+            order_id,
+            amount,
+            fee,
+            outcome: PaymentStatus::Settled,
+        });
+        Ok(())
+    }
+
+    /// Cancels a pooled order by mutual agreement: the merchant and the
+    /// coordinator both sign, and every contributor gets back exactly what
+    /// they put in, with no fee — same rule as `refund_escrow`, just fanned
+    /// out to everyone who funded the vault instead of a single buyer.
+    pub fn refund_pooled_escrow(ctx: Context<RefundPooledEscrow>, order_id: u64) -> Result<()> {
+        let payment = &ctx.accounts.payment;
+        require!(
+            payment.status == PaymentStatus::EscrowHeld,
+            ErrorCode::InvalidPaymentStatus
+        );
+        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+
+        release_pooled_split(
+            &ctx.accounts.token_program,
+            &ctx.accounts.escrow_vault,
+            &ctx.accounts.payment,
+            ctx.accounts.coordinator.to_account_info(),
+            ctx.remaining_accounts,
+            order_id,
+        )?;
+
+        let payment = &mut ctx.accounts.payment;
+        payment.status = PaymentStatus::Refunded;
+
+        emit!(PooledPaymentSettled {
+            coordinator: payment.coordinator,
+            merchant: payment.merchant,
+            order_id,
+            amount: payment.amount,
+            fee: 0,
+            outcome: PaymentStatus::Refunded,
+        });
+        Ok(())
+    }
+
+    /// No contributor delivered on, and none needs anyone's permission to
+    /// get their own money back: this is permissionless and time-gated
+    /// only, exactly like `reclaim_timeout`, except there is no single
+    /// buyer to privilege here — every contributor has an equal claim, so
+    /// each one is refunded their own recorded amount regardless of who
+    /// happens to submit this transaction.
+    pub fn reclaim_pooled_timeout(
+        ctx: Context<ReclaimPooledTimeout>,
+        order_id: u64,
+    ) -> Result<()> {
+        let payment = &ctx.accounts.payment;
+        require!(
+            payment.status == PaymentStatus::EscrowHeld,
+            ErrorCode::InvalidPaymentStatus
+        );
+        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+        require!(
+            Clock::get()?.unix_timestamp >= payment.expiry,
+            ErrorCode::ReclaimNotYetAvailable
+        );
+
+        release_pooled_split(
+            &ctx.accounts.token_program,
+            &ctx.accounts.escrow_vault,
+            &ctx.accounts.payment,
+            ctx.accounts.coordinator.to_account_info(),
+            ctx.remaining_accounts,
+            order_id,
+        )?;
+
+        let payment = &mut ctx.accounts.payment;
+        payment.status = PaymentStatus::Reclaimed;
+
+        emit!(PooledPaymentSettled {
+            coordinator: payment.coordinator,
+            merchant: payment.merchant,
+            order_id,
+            amount: payment.amount,
+            fee: 0,
+            outcome: PaymentStatus::Reclaimed,
+        });
+        Ok(())
+    }
+
+    /// Reclaims the rent of a finished pooled order record, same rule as
+    /// `close_payment`.
+    pub fn close_pooled_payment(ctx: Context<ClosePooledPayment>, order_id: u64) -> Result<()> {
+        let payment = &ctx.accounts.payment;
+        require!(
+            payment.status != PaymentStatus::EscrowHeld,
+            ErrorCode::PaymentStillOpen
+        );
+        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+        Ok(())
+    }
 }
 
 /// Moves `amount` out of the vault and closes it, signing as the Payment PDA.
@@ -488,6 +752,167 @@ fn settlement_fee(amount: u64) -> Result<u64> {
     Ok(fee as u64)
 }
 
+/// `release` for a `PooledPayment` — identical logic, different seed prefix
+/// and field name (`coordinator` instead of `buyer`), since a pooled order
+/// has no single buyer to derive its PDA from.
+fn release_pooled<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    destination: &Account<'info, TokenAccount>,
+    payment: &Account<'info, PooledPayment>,
+    rent_destination: AccountInfo<'info>,
+    amount: u64,
+    order_id: u64,
+) -> Result<()> {
+    let coordinator = payment.coordinator;
+    let merchant = payment.merchant;
+    let bump = payment.bump;
+    let order_id_bytes = order_id.to_le_bytes();
+    let signer_seeds: &[&[u8]] = &[
+        b"pooled_payment",
+        coordinator.as_ref(),
+        merchant.as_ref(),
+        &order_id_bytes,
+        &[bump],
+    ];
+
+    if amount > 0 {
+        token::transfer(
+            CpiContext::new_with_signer(
+                token_program.to_account_info(),
+                Transfer {
+                    from: vault.to_account_info(),
+                    to: destination.to_account_info(),
+                    authority: payment.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            amount,
+        )?;
+    }
+
+    token::close_account(CpiContext::new_with_signer(
+        token_program.to_account_info(),
+        CloseAccount {
+            account: vault.to_account_info(),
+            destination: rent_destination,
+            authority: payment.to_account_info(),
+        },
+        &[signer_seeds],
+    ))?;
+    Ok(())
+}
+
+/// `take_fee` for a `PooledPayment` — see `release_pooled`.
+fn take_fee_pooled<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    treasury_token: &Account<'info, TokenAccount>,
+    payment: &Account<'info, PooledPayment>,
+    fee: u64,
+    order_id: u64,
+) -> Result<()> {
+    if fee == 0 {
+        return Ok(());
+    }
+    let coordinator = payment.coordinator;
+    let merchant = payment.merchant;
+    let bump = payment.bump;
+    let order_id_bytes = order_id.to_le_bytes();
+    let signer_seeds: &[&[u8]] = &[
+        b"pooled_payment",
+        coordinator.as_ref(),
+        merchant.as_ref(),
+        &order_id_bytes,
+        &[bump],
+    ];
+    token::transfer(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            Transfer {
+                from: vault.to_account_info(),
+                to: treasury_token.to_account_info(),
+                authority: payment.to_account_info(),
+            },
+            &[signer_seeds],
+        ),
+        fee,
+    )
+}
+
+/// Refunds every contributor their own recorded amount out of the vault,
+/// then closes it, signing as the `PooledPayment` PDA. Used by both
+/// `refund_pooled_escrow` and `reclaim_pooled_timeout` — the only
+/// difference between those two is who is allowed to call this and when;
+/// once called, the money always goes back to exactly where it came from.
+/// `contributor_token_accounts` must list each contributor's own token
+/// account in the same order `payment.contributors` was recorded in.
+fn release_pooled_split<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    payment: &Account<'info, PooledPayment>,
+    rent_destination: AccountInfo<'info>,
+    contributor_token_accounts: &[AccountInfo<'info>],
+    order_id: u64,
+) -> Result<()> {
+    let contributor_count = payment.contributor_count as usize;
+    require!(
+        contributor_token_accounts.len() == contributor_count,
+        ErrorCode::InvalidPoolSize
+    );
+
+    let coordinator = payment.coordinator;
+    let merchant = payment.merchant;
+    let bump = payment.bump;
+    let order_id_bytes = order_id.to_le_bytes();
+    let signer_seeds: &[&[u8]] = &[
+        b"pooled_payment",
+        coordinator.as_ref(),
+        merchant.as_ref(),
+        &order_id_bytes,
+        &[bump],
+    ];
+
+    for i in 0..contributor_count {
+        let expected_contributor = payment.contributors[i];
+        let amount = payment.contributor_amounts[i];
+        let contributor_token_info = &contributor_token_accounts[i];
+
+        let contributor_token: Account<TokenAccount> = Account::try_from(contributor_token_info)?;
+        require!(
+            contributor_token.owner == expected_contributor,
+            ErrorCode::InvalidTokenOwner
+        );
+        require!(contributor_token.mint == payment.mint, ErrorCode::InvalidMint);
+
+        if amount > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_program.to_account_info(),
+                    Transfer {
+                        from: vault.to_account_info(),
+                        to: contributor_token_info.clone(),
+                        authority: payment.to_account_info(),
+                    },
+                    &[signer_seeds],
+                ),
+                amount,
+            )?;
+        }
+    }
+
+    token::close_account(CpiContext::new_with_signer(
+        token_program.to_account_info(),
+        CloseAccount {
+            account: vault.to_account_info(),
+            destination: rent_destination,
+            authority: payment.to_account_info(),
+        },
+        &[signer_seeds],
+    ))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -521,6 +946,35 @@ pub enum PaymentStatus {
     Reclaimed,
 }
 
+/// A `Payment`-equivalent for an order funded by multiple buyers instead of
+/// one. There is no single `buyer` field — `coordinator` plays that role
+/// for settlement (confirming or reclaiming), while `contributors` and
+/// `contributor_amounts` record exactly who funded the vault and how much,
+/// so a refund or reclaim can pay each of them back individually.
+#[account]
+#[derive(InitSpace)]
+pub struct PooledPayment {
+    pub coordinator: Pubkey,
+    pub merchant: Pubkey,
+    /// The SPL mint this order settles in.
+    pub mint: Pubkey,
+    pub order_id: u64,
+    /// The full order price: the sum of every contributor's own amount.
+    pub amount: u64,
+    /// The settlement fee actually charged. Zero until the order settles,
+    /// and zero forever on a refund or reclaim.
+    pub fee_amount: u64,
+    pub status: PaymentStatus,
+    pub created_at: i64,
+    /// Reclaim becomes available at this unix timestamp.
+    pub expiry: i64,
+    pub bump: u8,
+    pub vault_bump: u8,
+    pub contributor_count: u8,
+    pub contributors: [Pubkey; MAX_POOL_CONTRIBUTORS],
+    pub contributor_amounts: [u64; MAX_POOL_CONTRIBUTORS],
+}
+
 // ---------------------------------------------------------------------------
 // Events — the order history, once Payment accounts are closed.
 // ---------------------------------------------------------------------------
@@ -538,6 +992,27 @@ pub struct PaymentInitiated {
 #[event]
 pub struct PaymentSettled {
     pub buyer: Pubkey,
+    pub merchant: Pubkey,
+    pub order_id: u64,
+    pub amount: u64,
+    pub fee: u64,
+    pub outcome: PaymentStatus,
+}
+
+#[event]
+pub struct PooledPaymentInitiated {
+    pub coordinator: Pubkey,
+    pub merchant: Pubkey,
+    pub mint: Pubkey,
+    pub order_id: u64,
+    pub amount: u64,
+    pub contributor_count: u8,
+    pub expiry: i64,
+}
+
+#[event]
+pub struct PooledPaymentSettled {
+    pub coordinator: Pubkey,
     pub merchant: Pubkey,
     pub order_id: u64,
     pub amount: u64,
@@ -724,6 +1199,161 @@ pub struct ClosePayment<'info> {
     pub buyer: Signer<'info>,
 }
 
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct InitiatePooledPayment<'info> {
+    #[account(
+        init,
+        payer = coordinator,
+        space = 8 + PooledPayment::INIT_SPACE,
+        seeds = [b"pooled_payment", coordinator.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub payment: Box<Account<'info, PooledPayment>>,
+
+    /// The merchant being paid. Only their address is needed, same as
+    /// `InitiatePayment`.
+    /// CHECK: used solely as a PDA seed and stored for later settlement.
+    pub merchant: UncheckedAccount<'info>,
+
+    /// One of the contributors, standing in for a single buyer on
+    /// everything that follows (`confirm_pooled_delivery`,
+    /// `refund_pooled_escrow`). Pays for this account's rent.
+    #[account(mut)]
+    pub coordinator: Signer<'info>,
+
+    #[account(
+        init,
+        payer = coordinator,
+        seeds = [b"pooled_vault", payment.key().as_ref()],
+        bump,
+        token::mint = mint,
+        token::authority = payment,
+    )]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    pub mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct ConfirmPooledDelivery<'info> {
+    #[account(
+        mut,
+        seeds = [b"pooled_payment", coordinator.key().as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+    )]
+    pub payment: Box<Account<'info, PooledPayment>>,
+
+    #[account(mut)]
+    pub coordinator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pooled_vault", payment.key().as_ref()],
+        bump = payment.vault_bump,
+    )]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = merchant_token.owner == payment.merchant @ ErrorCode::InvalidTokenOwner,
+        constraint = merchant_token.mint == payment.mint @ ErrorCode::InvalidMint,
+    )]
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
+
+    /// Receives the settlement fee. Constrained to the compiled-in treasury,
+    /// same as `ConfirmDelivery`.
+    #[account(
+        mut,
+        constraint = treasury_token.owner == TREASURY @ ErrorCode::InvalidTreasury,
+        constraint = treasury_token.mint == payment.mint @ ErrorCode::InvalidMint,
+    )]
+    pub treasury_token: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// Mutual, instant cancellation for a pooled order: the merchant and the
+/// coordinator both sign, mirroring `RefundEscrow`. Every contributor's own
+/// token account arrives via `remaining_accounts`, in the same order
+/// `payment.contributors` was recorded in.
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct RefundPooledEscrow<'info> {
+    #[account(
+        mut,
+        seeds = [b"pooled_payment", coordinator.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+    )]
+    pub payment: Box<Account<'info, PooledPayment>>,
+
+    /// The refund is the merchant's own decision, so they sign it, same as
+    /// `RefundEscrow`.
+    #[account(constraint = merchant.key() == payment.merchant @ ErrorCode::InvalidMerchant)]
+    pub merchant: Signer<'info>,
+
+    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
+    pub coordinator: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pooled_vault", payment.key().as_ref()],
+        bump = payment.vault_bump,
+    )]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+/// Fixed accounts for `reclaim_pooled_timeout`. No signer is required: the
+/// clock is the only authorization, and every contributor's own token
+/// account (via `remaining_accounts`) can only ever receive that same
+/// contributor's own recorded amount back.
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct ReclaimPooledTimeout<'info> {
+    #[account(
+        mut,
+        seeds = [b"pooled_payment", payment.coordinator.as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+    )]
+    pub payment: Box<Account<'info, PooledPayment>>,
+
+    /// CHECK: only the vault's rent destination once closed; constrained to
+    /// the address already recorded on the payment.
+    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
+    pub coordinator: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"pooled_vault", payment.key().as_ref()],
+        bump = payment.vault_bump,
+    )]
+    pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct ClosePooledPayment<'info> {
+    #[account(
+        mut,
+        seeds = [b"pooled_payment", coordinator.key().as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+        close = coordinator,
+    )]
+    pub payment: Box<Account<'info, PooledPayment>>,
+
+    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
+    pub coordinator: Signer<'info>,
+}
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Payment amount must be greater than zero")]
@@ -752,4 +1382,8 @@ pub enum ErrorCode {
     ArithmeticOverflow,
     #[msg("Batch must contain 1 to MAX_BATCH_SIZE orders' worth of accounts, 4 per order")]
     InvalidBatchSize,
+    #[msg("Pooled payment must have 1 to MAX_POOL_CONTRIBUTORS contributors, with matching accounts")]
+    InvalidPoolSize,
+    #[msg("Signer is not the coordinator on this pooled payment")]
+    InvalidCoordinator,
 }
