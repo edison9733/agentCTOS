@@ -235,6 +235,14 @@ Stated plainly, because these are the first questions a reviewer asks:
 - **Token-2022 mints are not supported.** The program uses the legacy SPL Token
   program. Transfer-fee extensions would also break the escrow accounting,
   since the amount received would not match the amount sent.
+- **Every field on a `Payment` account is public.** Buyer, merchant, mint, and
+  amount are all plaintext, readable by anyone via RPC. Making this private
+  would mean either Token-2022's Confidential Transfer extension (hides
+  amount only; its ZK ElGamal proof program's mainnet/devnet status needs
+  checking before relying on it) or a live third-party network like Arcium's
+  Confidential SPL. Neither is built here — this is unverified, researched,
+  and left for later, not attempted blind in an environment with no Solana
+  toolchain to compile or test it.
 - **No partial delivery or dispute resolution.** An order is all-or-nothing.
 - **It is not audited.** This is hackathon-grade. A production version would
   want a permissionless post-expiry settlement path for abandoned buyers, a
