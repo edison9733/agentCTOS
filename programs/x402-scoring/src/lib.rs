@@ -193,8 +193,8 @@ pub mod x402_scoring {
 
         // -------- read the buyer's standing, if it has ever been opened.
         let established = if *ctx.accounts.buyer_standing.owner == crate::ID {
-            let standing_info = ctx.accounts.buyer_standing.to_account_info();
-            let standing: Account<BuyerStanding> = Account::try_from(&standing_info)?;
+            let standing: Account<BuyerStanding> =
+                Account::try_from(&ctx.accounts.buyer_standing)?;
             require!(standing.buyer == buyer_key, ErrorCode::InvalidStanding);
             standing.settled_count > 0
         } else {
@@ -204,8 +204,8 @@ pub mod x402_scoring {
         // -------- read the merchant's available reserve, if one is open.
         let (reserve_exists, available_reserve) =
             if *ctx.accounts.merchant_reserve.owner == crate::ID {
-                let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
-                let reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
+                let reserve: Account<MerchantReserve> =
+                    Account::try_from(&ctx.accounts.merchant_reserve)?;
                 require!(reserve.merchant == merchant_key, ErrorCode::InvalidReserve);
                 require!(reserve.mint == mint_key, ErrorCode::InvalidMint);
                 let expected_vault = Pubkey::create_program_address(
@@ -217,8 +217,8 @@ pub mod x402_scoring {
                     expected_vault == ctx.accounts.reserve_vault.key(),
                     ErrorCode::InvalidReserve
                 );
-                let vault_info = ctx.accounts.reserve_vault.to_account_info();
-                let vault: Account<TokenAccount> = Account::try_from(&vault_info)?;
+                let vault: Account<TokenAccount> =
+                    Account::try_from(&ctx.accounts.reserve_vault)?;
                 let available = vault.amount.saturating_sub(reserve.locked_exposure);
                 (true, available)
             } else {
@@ -252,8 +252,8 @@ pub mod x402_scoring {
             // can only be nonzero if available_reserve was read above, which
             // only happens when the reserve account actually exists.
             require!(reserve_exists, ErrorCode::InvalidReserve);
-            let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
-            let mut reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
+            let mut reserve: Account<MerchantReserve> =
+                Account::try_from(&ctx.accounts.merchant_reserve)?;
             reserve.locked_exposure = reserve
                 .locked_exposure
                 .checked_add(instant_amount)
@@ -324,8 +324,8 @@ pub mod x402_scoring {
             &ctx.accounts.treasury_token,
             &mut ctx.accounts.payment,
             ctx.accounts.buyer.to_account_info(),
-            &ctx.accounts.merchant_reserve.to_account_info(),
-            &ctx.accounts.buyer_standing.to_account_info(),
+            &ctx.accounts.merchant_reserve,
+            &ctx.accounts.buyer_standing,
             order_id,
         )
     }
@@ -398,8 +398,8 @@ pub mod x402_scoring {
             &ctx.accounts.treasury_token,
             &mut ctx.accounts.payment,
             ctx.accounts.merchant.to_account_info(),
-            &ctx.accounts.merchant_reserve.to_account_info(),
-            &ctx.accounts.buyer_standing.to_account_info(),
+            &ctx.accounts.merchant_reserve,
+            &ctx.accounts.buyer_standing,
             order_id,
         )
     }
@@ -440,11 +440,10 @@ pub mod x402_scoring {
                 *ctx.accounts.merchant_reserve.owner == crate::ID,
                 ErrorCode::InvalidReserve
             );
-            let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
-            let mut reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
+            let mut reserve: Account<MerchantReserve> =
+                Account::try_from(&ctx.accounts.merchant_reserve)?;
             require!(reserve.merchant == merchant, ErrorCode::InvalidReserve);
-            let vault_info = ctx.accounts.reserve_vault.to_account_info();
-            let vault: Account<TokenAccount> = Account::try_from(&vault_info)?;
+            let vault: Account<TokenAccount> = Account::try_from(&ctx.accounts.reserve_vault)?;
             require!(vault.owner == ctx.accounts.merchant_reserve.key(), ErrorCode::InvalidReserve);
 
             // Made whole up to whatever the reserve actually still holds —
@@ -947,15 +946,15 @@ pub struct InitiatePayment<'info> {
     /// have opened a reserve to receive payment at all, only to be eligible
     /// for the instant portion.
     #[account(seeds = [b"reserve", merchant.key().as_ref()], bump)]
-    pub merchant_reserve: UncheckedAccount<'info>,
+    pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: the reserve's vault, only read when `merchant_reserve` exists.
-    pub reserve_vault: UncheckedAccount<'info>,
+    pub reserve_vault: AccountInfo<'info>,
 
     /// CHECK: may or may not exist yet — see `merchant_reserve` above, same
     /// reasoning for the buyer's own standing.
     #[account(seeds = [b"standing", buyer.key().as_ref()], bump)]
-    pub buyer_standing: UncheckedAccount<'info>,
+    pub buyer_standing: AccountInfo<'info>,
 
     pub mint: Box<Account<'info, Mint>>,
 
@@ -1001,11 +1000,11 @@ pub struct ConfirmDelivery<'info> {
     /// CHECK: only touched if `payment.instant_amount > 0`, in which case it
     /// is guaranteed to already exist.
     #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
-    pub merchant_reserve: UncheckedAccount<'info>,
+    pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: only touched if it already exists — see `register_buyer`.
     #[account(seeds = [b"standing", buyer.key().as_ref()], bump)]
-    pub buyer_standing: UncheckedAccount<'info>,
+    pub buyer_standing: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1079,11 +1078,11 @@ pub struct FinalizeClaim<'info> {
 
     /// CHECK: only touched if `payment.instant_amount > 0`.
     #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
-    pub merchant_reserve: UncheckedAccount<'info>,
+    pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: only touched if it already exists.
     #[account(seeds = [b"standing", payment.buyer.as_ref()], bump)]
-    pub buyer_standing: UncheckedAccount<'info>,
+    pub buyer_standing: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1117,11 +1116,11 @@ pub struct ReclaimTimeout<'info> {
 
     /// CHECK: only touched if `payment.instant_amount > 0`.
     #[account(mut, seeds = [b"reserve", payment.merchant.as_ref()], bump)]
-    pub merchant_reserve: UncheckedAccount<'info>,
+    pub merchant_reserve: AccountInfo<'info>,
 
     /// CHECK: only touched if `payment.instant_amount > 0`.
     #[account(mut)]
-    pub reserve_vault: UncheckedAccount<'info>,
+    pub reserve_vault: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
 }
