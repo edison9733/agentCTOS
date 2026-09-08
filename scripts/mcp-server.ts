@@ -89,6 +89,15 @@ const vaultPda = (payment: PublicKey) =>
     program.programId
   )[0];
 
+const reservePda = (merchant: PublicKey) =>
+  PublicKey.findProgramAddressSync([Buffer.from("reserve"), merchant.toBuffer()], program.programId)[0];
+
+const reserveVaultPda = (reserve: PublicKey) =>
+  PublicKey.findProgramAddressSync([Buffer.from("reserve_vault"), reserve.toBuffer()], program.programId)[0];
+
+const standingPda = (buyer: PublicKey) =>
+  PublicKey.findProgramAddressSync([Buffer.from("standing"), buyer.toBuffer()], program.programId)[0];
+
 function explorer(kind: "tx" | "address", id: string): string {
   const base = `https://explorer.solana.com/${kind}/${id}`;
   if (rpcUrl.includes("devnet")) return `${base}?cluster=devnet`;
@@ -187,6 +196,7 @@ server.registerTool(
       const id = new BN(order_id ?? Date.now() % 1_000_000_000);
       const payment = paymentPda(merchantKey, id);
 
+      const reserve = reservePda(merchantKey);
       const sig = await program.methods
         .initiatePayment(toBase(amount, dec), id, new BN(timeout_seconds ?? 3600))
         .accounts({
@@ -194,7 +204,11 @@ server.registerTool(
           merchant: merchantKey,
           buyer: wallet.publicKey,
           buyerToken: await ata(mintKey, wallet.publicKey),
+          merchantToken: await ata(mintKey, merchantKey),
           escrowVault: vaultPda(payment),
+          merchantReserve: reserve,
+          reserveVault: reserveVaultPda(reserve),
+          buyerStanding: standingPda(wallet.publicKey),
           mint: mintKey,
           tokenProgram: TOKEN_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
@@ -204,17 +218,19 @@ server.registerTool(
         .rpc();
 
       const p: any = await program.account.payment.fetch(payment);
+      const instant = toWhole(p.instantAmount, dec);
       return ok(
         [
-          `Paid ${amount} tokens to ${merchant}, held in escrow.`,
+          `Paid ${amount} tokens to ${merchant}.`,
           "",
           `  order_id             ${id.toString()}   <- keep this to settle the order`,
-          `  held in escrow       ${toWhole(p.amount, dec)}`,
-          `  merchant received    0  (nothing until you confirm)`,
+          instant > 0
+            ? `  paid instantly       ${instant}  (covered by the merchant's own posted reserve)`
+            : `  held in escrow       ${toWhole(p.escrowedAmount, dec)}`,
           `  reclaimable after    ${new Date(p.expiry.toNumber() * 1000).toISOString()}`,
           `  transaction          ${explorer("tx", sig)}`,
           "",
-          "Call confirm_delivery when the goods arrive. If they never do, call reclaim_payment after the time above — the merchant cannot block it.",
+          "Call confirm_delivery when the goods arrive. If they never do, call reclaim_payment after the time above — the merchant cannot block it, and if any part was paid instantly, that part is recovered from the merchant's own posted collateral too.",
         ].join("\n")
       );
     } catch (e) {
@@ -293,6 +309,8 @@ server.registerTool(
           escrowVault: vaultPda(payment),
           merchantToken: await ata(mintKey, merchantKey),
           treasuryToken: await ata(mintKey, TREASURY),
+          merchantReserve: reservePda(merchantKey),
+          buyerStanding: standingPda(wallet.publicKey),
           tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([wallet])
@@ -330,6 +348,8 @@ server.registerTool(
       const mintKey = p.mint as PublicKey;
       const dec = await decimalsOf(mintKey);
 
+      const merchantKey = new PublicKey(merchant);
+      const reserve = reservePda(merchantKey);
       const sig = await program.methods
         .reclaimTimeout(id)
         .accounts({
@@ -337,6 +357,8 @@ server.registerTool(
           buyer: wallet.publicKey,
           escrowVault: vaultPda(payment),
           buyerToken: await ata(mintKey, wallet.publicKey),
+          merchantReserve: reserve,
+          reserveVault: reserveVaultPda(reserve),
           tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([wallet])

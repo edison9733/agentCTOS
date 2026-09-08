@@ -5,85 +5,176 @@ use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer}
 declare_id!("HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4");
 
 // ---------------------------------------------------------------------------
-// Agent CTOS — x402 Escrow
+// Agent CTOS — x402 Escrow, routed by collateral
 //
-// x402's `exact` scheme on Solana is a single irreversible transfer: the buyer
-// signs, the facilitator submits, and the money is gone the moment the
-// transaction lands. If the merchant never delivers, the buyer has no recourse.
+// Every payment is split by a router that reads both parties before moving
+// anything: how much of the order can be paid to the merchant *instantly*,
+// uncollateralized, and how much must sit in escrow until one of exactly two
+// things happens — the buyer confirms fulfillment, or the clock runs out.
 //
-// This program replaces that transfer with an escrow. Every payment is held in
-// full until one of three things happens:
+// The instant portion is never a matter of trust. It is capped by collateral
+// the merchant has actually posted (`MerchantReserve`) and gated by whether
+// this specific buyer has ever completed an order before (`BuyerStanding`).
+// If the merchant never delivers, `reclaim_timeout` does not just return the
+// escrowed remainder — it skims the merchant's own posted reserve to make
+// the buyer whole for the instant portion too. Extraction is bounded by
+// collateral, not by knowing who anyone is.
 //
-//   confirm_delivery  buyer signs                -> the merchant is paid
-//   refund_escrow     buyer AND merchant sign     -> the buyer is repaid
-//   reclaim_timeout   buyer signs, after expiry   -> the buyer takes it back
-//
-// The design rule behind those three: an *instant* reversal needs both parties
-// to agree, and anything one party can do alone must wait for the clock. That
-// is what stops either side rugging the other — a buyer cannot take delivery
-// and then pull the money back, and a merchant cannot keep money the buyer
-// never confirmed.
-//
-// The vault holding the tokens is owned by the Payment account itself, not by
-// any keypair. There is no operator, no admin, and no key anywhere in this
-// program that can move a buyer's funds. Releases are signed by the Payment
-// PDA's own seeds.
+// That is also why reputation stops being a fraud control here. Faking
+// `BuyerStanding` cannot unlock more than a merchant's own reserve already
+// covers, and faking `MerchantReserve` is impossible — it is real tokens,
+// checked by the SPL token program, not a number a caller can set. A swarm
+// of throwaway wallets has nothing to take: with no reserve or no history,
+// every order defaults to full escrow, and a fully-escrowed order can always
+// be reclaimed on timeout regardless of what anyone claims about themselves.
 // ---------------------------------------------------------------------------
 
-/// The protocol fee, in basis points of the order amount, charged only when an
-/// order settles successfully. A percentage rather than a flat amount, so it
-/// stays proportionate on a $0.001 API call and on a $10,000 order alike — a
-/// flat fee would price micropayments, x402's main use case, out entirely.
-///
-/// Refunds and reclaims are free: a buyer who did not get what they paid for
-/// pays nothing, and the protocol only earns when commerce actually works.
+/// The protocol fee, in basis points, charged only on the *escrowed* portion
+/// of an order when it settles successfully. The instant portion carries no
+/// fee at all — a merchant who has posted real collateral has already paid
+/// the cost of earning instant eligibility, and taxing the thing collateral
+/// is meant to incentivize would undercut the incentive.
 const FEE_BPS: u64 = 50; // 0.50%
 
-/// Where settlement fees are sent. Compiled in rather than stored in a config
-/// account on purpose: there is no admin instruction that can redirect it, and
-/// changing it requires a program upgrade that anyone can see on-chain.
+/// Where settlement fees are sent. Compiled in, not stored in a config
+/// account, so no admin instruction can redirect it.
 pub const TREASURY: Pubkey = pubkey!("5i7zzV9hQUCbpg8MXSNJB3QQkL6zscDd8VQKow46vg7E");
 
 /// Bounds on how long an escrow may run before the buyer can reclaim it.
-/// The floor stops a buyer from setting a deadline no merchant could meet;
-/// the ceiling stops funds being locked indefinitely.
 const MIN_TIMEOUT_SECONDS: i64 = 60;
 const MAX_TIMEOUT_SECONDS: i64 = 30 * 24 * 60 * 60; // 30 days
 
-/// `batch_confirm_delivery` reads its orders from `remaining_accounts` in
-/// groups of this many: `[payment, escrow_vault, merchant_token,
-/// treasury_token]`, in that order.
-const ACCOUNTS_PER_BATCH_ORDER: usize = 4;
+/// How long a merchant's unopposed fulfillment claim must sit before
+/// `finalize_claim` can release it to them. Long enough for a genuine buyer
+/// to notice and dispute; short enough that an absent buyer does not strand
+/// an honest merchant indefinitely.
+const CLAIM_DISPUTE_SECONDS: i64 = 24 * 60 * 60; // 24 hours
 
-/// Caps a batch well inside Solana's legacy transaction account limit
-/// (~35 accounts). At 4 accounts/order plus the buyer and token_program
-/// shared across the whole batch, 8 orders comfortably fits one transaction;
-/// a client wanting more needs an Address Lookup Table.
-const MAX_BATCH_SIZE: usize = 8;
-
-/// `initiate_pooled_payment` splits one order's cost across up to this many
-/// distinct contributors, each transferring their own declared share from
-/// their own token account within the same transaction. Meant to be
-/// assembled off-chain: a matching service collects interested buyers,
-/// checks each one's own price ceiling against their required share, and
-/// only builds this transaction once every contributor has already agreed
-/// to sign for their exact amount.
-const MAX_POOL_CONTRIBUTORS: usize = 4;
-
-/// Accounts consumed per contributor in `initiate_pooled_payment`'s
-/// `remaining_accounts`: `[contributor (signer), contributor_token]`.
-const ACCOUNTS_PER_CONTRIBUTION: usize = 2;
+/// Named, published constants for the one attack this program does not
+/// eliminate: a merchant that builds real `BuyerStanding`-eligible history,
+/// then takes an instant payment on an order it never intends to deliver.
+///
+/// This build enforces strict 1:1 collateralization — `initiate_payment`
+/// never lets the instant portion of an order exceed a merchant's own
+/// currently-available reserve (see `route_payment` below) — so a bust-out
+/// costs the merchant exactly its own forfeited collateral, and the buyer is
+/// always made whole by the reserve skim in `reclaim_timeout`. There is no
+/// leverage extended beyond posted collateral in this version.
+///
+/// `LIMIT_COEFFICIENT_K` and `RESERVE_SKIM_RATE_C` are published here for a
+/// *leveraged* future version, where instant eligibility is extended some
+/// bounded amount beyond raw reserve coverage. In that design, a patient
+/// attacker's faked payoff grows like `k * sqrt(faked_volume)` while its
+/// cost to fake grows linearly (`c * faked_volume`); the gap between them is
+/// maximized at `k^2 / (4c)`, which becomes the known, chosen ceiling on
+/// what that attack can ever extract. See README "Pricing the patient
+/// attacker" for the worked number — publishing it, rather than leaving it
+/// undiscovered, is the point of naming these constants at all.
+const LIMIT_COEFFICIENT_K: u64 = 100;
+const RESERVE_SKIM_RATE_C: u64 = 5;
 
 #[program]
 pub mod x402_scoring {
     use super::*;
 
-    /// Takes payment for one order and holds the whole amount in escrow.
-    ///
-    /// The merchant receives nothing at this point. `order_id` is chosen by the
-    /// caller and, together with the buyer and merchant, forms the Payment
-    /// account's address — so replaying the same order id is rejected by the
-    /// runtime rather than by a check here.
+    /// One-time setup: a merchant opens its collateral reserve. Must be
+    /// called before `post_reserve` — separated from it so both use plain
+    /// `init` rather than an init-if-needed pattern.
+    pub fn open_reserve(ctx: Context<OpenReserve>) -> Result<()> {
+        let reserve = &mut ctx.accounts.reserve;
+        reserve.merchant = ctx.accounts.merchant.key();
+        reserve.mint = ctx.accounts.mint.key();
+        reserve.locked_exposure = 0;
+        reserve.bump = ctx.bumps.reserve;
+        reserve.vault_bump = ctx.bumps.reserve_vault;
+
+        emit!(ReserveOpened {
+            merchant: reserve.merchant,
+            mint: reserve.mint,
+        });
+        Ok(())
+    }
+
+    /// Deposits collateral into an already-opened reserve. Callable any
+    /// number of times to top it up.
+    pub fn post_reserve(ctx: Context<PostReserve>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.merchant_token.to_account_info(),
+                    to: ctx.accounts.reserve_vault.to_account_info(),
+                    authority: ctx.accounts.merchant.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        emit!(ReservePosted {
+            merchant: ctx.accounts.reserve.merchant,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Withdraws collateral that is not currently backing an outstanding
+    /// instant payment. A merchant can never pull collateral out from under
+    /// an order it is still on the hook for.
+    pub fn withdraw_reserve(ctx: Context<WithdrawReserve>, amount: u64) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        let reserve = &ctx.accounts.reserve;
+        let available = ctx
+            .accounts
+            .reserve_vault
+            .amount
+            .checked_sub(reserve.locked_exposure)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        require!(amount <= available, ErrorCode::InsufficientReserve);
+
+        // The vault's authority is the *reserve* account itself (see
+        // `token::authority = reserve` in `OpenReserve`), so the CPI below
+        // signs with the reserve's own seeds, not a separate vault PDA.
+        let merchant = reserve.merchant;
+        let reserve_bump = reserve.bump;
+        let signer_seeds: &[&[u8]] = &[b"reserve", merchant.as_ref(), &[reserve_bump]];
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.reserve_vault.to_account_info(),
+                    to: ctx.accounts.merchant_token.to_account_info(),
+                    authority: ctx.accounts.reserve.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            amount,
+        )?;
+        emit!(ReserveWithdrawn {
+            merchant: ctx.accounts.reserve.merchant,
+            amount,
+        });
+        Ok(())
+    }
+
+    /// One-time, optional setup: a buyer opts in to building `BuyerStanding`.
+    /// A buyer who never calls this can still pay for anything — every one
+    /// of their orders simply defaults to full escrow, the safe outcome,
+    /// forever. There is no penalty for not registering, only no eligibility
+    /// for instant settlement.
+    pub fn register_buyer(ctx: Context<RegisterBuyer>) -> Result<()> {
+        let standing = &mut ctx.accounts.standing;
+        standing.buyer = ctx.accounts.buyer.key();
+        standing.settled_count = 0;
+        standing.bump = ctx.bumps.standing;
+        Ok(())
+    }
+
+    /// Takes payment for one order and routes it: instantly to the merchant
+    /// up to whatever its own posted reserve currently covers, for a buyer
+    /// who has completed at least one order before; escrowed otherwise.
+    /// `order_id`, together with the buyer and merchant, forms the Payment
+    /// account's address, so a replayed order id is rejected by the runtime.
     pub fn initiate_payment(
         ctx: Context<InitiatePayment>,
         amount: u64,
@@ -96,31 +187,110 @@ pub mod x402_scoring {
             ErrorCode::InvalidTimeout
         );
 
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.buyer_token.to_account_info(),
-                    to: ctx.accounts.escrow_vault.to_account_info(),
-                    authority: ctx.accounts.buyer.to_account_info(),
-                },
-            ),
-            amount,
-        )?;
+        let mint_key = ctx.accounts.mint.key();
+        let merchant_key = ctx.accounts.merchant.key();
+        let buyer_key = ctx.accounts.buyer.key();
+
+        // -------- read the buyer's standing, if it has ever been opened.
+        let established = if *ctx.accounts.buyer_standing.owner == crate::ID {
+            let standing: Account<BuyerStanding> =
+                Account::try_from(&ctx.accounts.buyer_standing)?;
+            require!(standing.buyer == buyer_key, ErrorCode::InvalidStanding);
+            standing.settled_count > 0
+        } else {
+            false
+        };
+
+        // -------- read the merchant's available reserve, if one is open.
+        let (reserve_exists, available_reserve) =
+            if *ctx.accounts.merchant_reserve.owner == crate::ID {
+                let reserve: Account<MerchantReserve> =
+                    Account::try_from(&ctx.accounts.merchant_reserve)?;
+                require!(reserve.merchant == merchant_key, ErrorCode::InvalidReserve);
+                require!(reserve.mint == mint_key, ErrorCode::InvalidMint);
+                let expected_vault = Pubkey::create_program_address(
+                    &[b"reserve_vault", ctx.accounts.merchant_reserve.key.as_ref(), &[reserve.vault_bump]],
+                    ctx.program_id,
+                )
+                .map_err(|_| error!(ErrorCode::InvalidReserve))?;
+                require!(
+                    expected_vault == ctx.accounts.reserve_vault.key(),
+                    ErrorCode::InvalidReserve
+                );
+                let vault: Account<TokenAccount> =
+                    Account::try_from(&ctx.accounts.reserve_vault)?;
+                let available = vault.amount.saturating_sub(reserve.locked_exposure);
+                (true, available)
+            } else {
+                (false, 0u64)
+            };
+
+        // -------- the router: apply the reserve x standing table.
+        let (instant_amount, escrowed_amount) = if available_reserve >= amount && established {
+            (amount, 0u64)
+        } else if available_reserve > 0 && available_reserve < amount && established {
+            (available_reserve, amount - available_reserve)
+        } else {
+            (0u64, amount)
+        };
+
+        if instant_amount > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.buyer_token.to_account_info(),
+                        to: ctx.accounts.merchant_token.to_account_info(),
+                        authority: ctx.accounts.buyer.to_account_info(),
+                    },
+                ),
+                instant_amount,
+            )?;
+
+            // Lock this order's instant amount against the merchant's own
+            // reserve. `reserve_exists` is guaranteed true here: instant_amount
+            // can only be nonzero if available_reserve was read above, which
+            // only happens when the reserve account actually exists.
+            require!(reserve_exists, ErrorCode::InvalidReserve);
+            let mut reserve: Account<MerchantReserve> =
+                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            reserve.locked_exposure = reserve
+                .locked_exposure
+                .checked_add(instant_amount)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+            reserve.exit(ctx.program_id)?;
+        }
+
+        if escrowed_amount > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.buyer_token.to_account_info(),
+                        to: ctx.accounts.escrow_vault.to_account_info(),
+                        authority: ctx.accounts.buyer.to_account_info(),
+                    },
+                ),
+                escrowed_amount,
+            )?;
+        }
 
         let now = Clock::get()?.unix_timestamp;
         let payment = &mut ctx.accounts.payment;
-        payment.buyer = ctx.accounts.buyer.key();
-        payment.merchant = ctx.accounts.merchant.key();
-        payment.mint = ctx.accounts.mint.key();
+        payment.buyer = buyer_key;
+        payment.merchant = merchant_key;
+        payment.mint = mint_key;
         payment.order_id = order_id;
         payment.amount = amount;
+        payment.instant_amount = instant_amount;
+        payment.escrowed_amount = escrowed_amount;
         payment.fee_amount = 0;
         payment.status = PaymentStatus::EscrowHeld;
         payment.created_at = now;
         payment.expiry = now
             .checked_add(timeout_seconds)
             .ok_or(ErrorCode::ArithmeticOverflow)?;
+        payment.claimed_at = 0;
         payment.bump = ctx.bumps.payment;
         payment.vault_bump = ctx.bumps.escrow_vault;
 
@@ -130,220 +300,115 @@ pub mod x402_scoring {
             mint: payment.mint,
             order_id,
             amount,
+            instant_amount,
+            escrowed_amount,
             expiry: payment.expiry,
         });
         Ok(())
     }
 
-    /// The buyer confirms the order arrived. Releases the escrow to the merchant.
+    /// The buyer confirms the order arrived. Releases the escrowed portion
+    /// to the merchant (less the settlement fee), unlocks the merchant's
+    /// reserve exposure for this order, and raises the buyer's own standing.
     pub fn confirm_delivery(ctx: Context<ConfirmDelivery>, order_id: u64) -> Result<()> {
-        let payment = &ctx.accounts.payment;
         require!(
-            payment.status == PaymentStatus::EscrowHeld,
+            ctx.accounts.payment.status == PaymentStatus::EscrowHeld,
             ErrorCode::InvalidPaymentStatus
         );
-        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+        require!(ctx.accounts.payment.order_id == order_id, ErrorCode::InvalidOrder);
 
-        let amount = payment.amount;
-        let fee = settlement_fee(amount)?;
-        let to_merchant = amount.checked_sub(fee).ok_or(ErrorCode::ArithmeticOverflow)?;
-
-        take_fee(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.treasury_token,
-            &ctx.accounts.payment,
-            fee,
-            order_id,
-        )?;
-        release(
+        settle_fulfilled(
             &ctx.accounts.token_program,
             &ctx.accounts.escrow_vault,
             &ctx.accounts.merchant_token,
-            &ctx.accounts.payment,
+            &ctx.accounts.treasury_token,
+            &mut ctx.accounts.payment,
             ctx.accounts.buyer.to_account_info(),
-            to_merchant,
+            &ctx.accounts.merchant_reserve,
+            &ctx.accounts.buyer_standing,
             order_id,
-        )?;
+        )
+    }
 
+    /// The merchant claims this order was fulfilled, without the buyer
+    /// having confirmed. Starts the dispute window: if the buyer does not
+    /// call `dispute_claim` before `CLAIM_DISPUTE_SECONDS` pass, anyone can
+    /// call `finalize_claim` to settle it exactly as a confirmation would.
+    /// Fixes the case where an honest merchant delivered but the buyer
+    /// simply never returns to confirm.
+    pub fn claim_fulfillment(ctx: Context<ClaimFulfillment>, order_id: u64) -> Result<()> {
         let payment = &mut ctx.accounts.payment;
-        payment.status = PaymentStatus::Settled;
-        payment.fee_amount = fee;
-
-        emit!(PaymentSettled {
-            buyer: payment.buyer,
-            merchant: payment.merchant,
-            order_id,
-            amount,
-            fee,
-            outcome: PaymentStatus::Settled,
-        });
-        Ok(())
-    }
-
-    /// Settles up to `MAX_BATCH_SIZE` orders in one transaction, instead of
-    /// one `confirm_delivery` transaction per order.
-    ///
-    /// Same rule as `confirm_delivery` — the buyer signs, the merchant is
-    /// paid, the fee is charged — just applied to a whole list of orders at
-    /// once. Every four consecutive accounts in `remaining_accounts` are one
-    /// order's `[payment, escrow_vault, merchant_token, treasury_token]`.
-    /// All orders in one call must belong to this same buyer, since a
-    /// transaction carries only the one signature.
-    ///
-    /// This exists purely to amortize Solana's per-transaction signature fee
-    /// and confirmation wait across many orders — it changes nothing about
-    /// custody or the settlement rule itself, and reuses the exact same
-    /// `release`/`take_fee` helpers `confirm_delivery` uses one order at a
-    /// time.
-    pub fn batch_confirm_delivery(ctx: Context<BatchConfirmDelivery>) -> Result<()> {
-        let remaining = ctx.remaining_accounts;
-        require!(!remaining.is_empty(), ErrorCode::InvalidBatchSize);
-        require!(
-            remaining.len() % ACCOUNTS_PER_BATCH_ORDER == 0,
-            ErrorCode::InvalidBatchSize
-        );
-        let order_count = remaining.len() / ACCOUNTS_PER_BATCH_ORDER;
-        require!(order_count <= MAX_BATCH_SIZE, ErrorCode::InvalidBatchSize);
-
-        let buyer_key = ctx.accounts.buyer.key();
-
-        for i in 0..order_count {
-            let base = i * ACCOUNTS_PER_BATCH_ORDER;
-            let payment_info = &remaining[base];
-            let vault_info = &remaining[base + 1];
-            let merchant_token_info = &remaining[base + 2];
-            let treasury_token_info = &remaining[base + 3];
-
-            // Same checks `#[account(seeds = ..., bump = payment.bump)]` runs
-            // for a single typed account, written by hand because this
-            // account's position in the account list is dynamic.
-            let mut payment: Account<Payment> = Account::try_from(payment_info)?;
-            require!(payment.buyer == buyer_key, ErrorCode::InvalidBuyer);
-            require!(
-                payment.status == PaymentStatus::EscrowHeld,
-                ErrorCode::InvalidPaymentStatus
-            );
-            let expected_payment = Pubkey::create_program_address(
-                &[
-                    b"payment",
-                    buyer_key.as_ref(),
-                    payment.merchant.as_ref(),
-                    &payment.order_id.to_le_bytes(),
-                    &[payment.bump],
-                ],
-                ctx.program_id,
-            )
-            .map_err(|_| error!(ErrorCode::InvalidOrder))?;
-            require!(
-                expected_payment == payment_info.key(),
-                ErrorCode::InvalidOrder
-            );
-
-            let vault: Account<TokenAccount> = Account::try_from(vault_info)?;
-            let expected_vault = Pubkey::create_program_address(
-                &[b"vault", payment_info.key().as_ref(), &[payment.vault_bump]],
-                ctx.program_id,
-            )
-            .map_err(|_| error!(ErrorCode::InvalidOrder))?;
-            require!(expected_vault == vault_info.key(), ErrorCode::InvalidOrder);
-
-            let merchant_token: Account<TokenAccount> = Account::try_from(merchant_token_info)?;
-            require!(
-                merchant_token.owner == payment.merchant,
-                ErrorCode::InvalidTokenOwner
-            );
-            require!(merchant_token.mint == payment.mint, ErrorCode::InvalidMint);
-
-            let treasury_token: Account<TokenAccount> = Account::try_from(treasury_token_info)?;
-            require!(treasury_token.owner == TREASURY, ErrorCode::InvalidTreasury);
-            require!(treasury_token.mint == payment.mint, ErrorCode::InvalidMint);
-
-            let amount = payment.amount;
-            let fee = settlement_fee(amount)?;
-            let to_merchant = amount.checked_sub(fee).ok_or(ErrorCode::ArithmeticOverflow)?;
-            let order_id = payment.order_id;
-
-            take_fee(
-                &ctx.accounts.token_program,
-                &vault,
-                &treasury_token,
-                &payment,
-                fee,
-                order_id,
-            )?;
-            release(
-                &ctx.accounts.token_program,
-                &vault,
-                &merchant_token,
-                &payment,
-                ctx.accounts.buyer.to_account_info(),
-                to_merchant,
-                order_id,
-            )?;
-
-            payment.status = PaymentStatus::Settled;
-            payment.fee_amount = fee;
-            payment.exit(ctx.program_id)?;
-
-            emit!(PaymentSettled {
-                buyer: payment.buyer,
-                merchant: payment.merchant,
-                order_id,
-                amount,
-                fee,
-                outcome: PaymentStatus::Settled,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Cancels an order by mutual agreement: both the buyer and the merchant
-    /// sign, and the money goes back to the buyer in full with no fee.
-    ///
-    /// Requiring both signatures is what stops each side rugging the other. A
-    /// buyer alone could otherwise take delivery and pull the money back; a
-    /// merchant alone could cancel an order they had already been paid for.
-    /// Either party acting unilaterally has exactly one route — the buyer waits
-    /// for the expiry and calls `reclaim_timeout`, the merchant asks the buyer
-    /// to confirm.
-    pub fn refund_escrow(ctx: Context<RefundEscrow>, order_id: u64) -> Result<()> {
-        let payment = &ctx.accounts.payment;
         require!(
             payment.status == PaymentStatus::EscrowHeld,
             ErrorCode::InvalidPaymentStatus
         );
         require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+        require!(payment.claimed_at == 0, ErrorCode::AlreadyClaimed);
+        require!(
+            Clock::get()?.unix_timestamp < payment.expiry,
+            ErrorCode::ReclaimNotYetAvailable
+        );
 
-        let amount = payment.amount;
-        release(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.buyer_token,
-            &ctx.accounts.payment,
-            ctx.accounts.buyer.to_account_info(),
-            amount,
-            order_id,
-        )?;
-
-        let payment = &mut ctx.accounts.payment;
-        payment.status = PaymentStatus::Refunded;
-
-        emit!(PaymentSettled {
+        payment.claimed_at = Clock::get()?.unix_timestamp;
+        emit!(FulfillmentClaimed {
             buyer: payment.buyer,
             merchant: payment.merchant,
             order_id,
-            amount,
-            fee: 0,
-            outcome: PaymentStatus::Refunded,
+            claimed_at: payment.claimed_at,
         });
         Ok(())
     }
 
-    /// The merchant never delivered. After the expiry the buyer takes the
-    /// escrow back alone — no merchant signature, no operator, nothing the
-    /// merchant can do to block it.
+    /// The buyer disputes an active claim: it genuinely was not fulfilled.
+    /// Clears the claim and falls back to the normal timeout path — the
+    /// merchant may claim again if it believes otherwise, or the buyer
+    /// reclaims at `expiry` as usual.
+    pub fn dispute_claim(ctx: Context<DisputeClaim>, order_id: u64) -> Result<()> {
+        let payment = &mut ctx.accounts.payment;
+        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
+        require!(payment.claimed_at != 0, ErrorCode::NoActiveClaim);
+        payment.claimed_at = 0;
+        emit!(ClaimDisputed {
+            buyer: payment.buyer,
+            merchant: payment.merchant,
+            order_id,
+        });
+        Ok(())
+    }
+
+    /// Once an unopposed claim has sat for `CLAIM_DISPUTE_SECONDS`, settles
+    /// the order exactly as `confirm_delivery` would. Anyone can call this —
+    /// the dispute window, not a signature, is what protects the buyer.
+    pub fn finalize_claim(ctx: Context<FinalizeClaim>, order_id: u64) -> Result<()> {
+        require!(
+            ctx.accounts.payment.status == PaymentStatus::EscrowHeld,
+            ErrorCode::InvalidPaymentStatus
+        );
+        require!(ctx.accounts.payment.order_id == order_id, ErrorCode::InvalidOrder);
+        require!(ctx.accounts.payment.claimed_at != 0, ErrorCode::NoActiveClaim);
+        require!(
+            Clock::get()?.unix_timestamp >= ctx.accounts.payment.claimed_at + CLAIM_DISPUTE_SECONDS,
+            ErrorCode::ClaimNotYetFinalizable
+        );
+
+        settle_fulfilled(
+            &ctx.accounts.token_program,
+            &ctx.accounts.escrow_vault,
+            &ctx.accounts.merchant_token,
+            &ctx.accounts.treasury_token,
+            &mut ctx.accounts.payment,
+            ctx.accounts.merchant.to_account_info(),
+            &ctx.accounts.merchant_reserve,
+            &ctx.accounts.buyer_standing,
+            order_id,
+        )
+    }
+
+    /// The merchant never delivered, and never successfully claimed to. The
+    /// buyer takes the escrowed remainder back, and the merchant's own
+    /// reserve is skimmed for up to the instant amount it was already
+    /// paid — the buyer is made whole either way. No signature but the
+    /// clock is required.
     pub fn reclaim_timeout(ctx: Context<ReclaimTimeout>, order_id: u64) -> Result<()> {
         let payment = &ctx.accounts.payment;
         require!(
@@ -356,16 +421,60 @@ pub mod x402_scoring {
             ErrorCode::ReclaimNotYetAvailable
         );
 
-        let amount = payment.amount;
+        let escrowed_amount = payment.escrowed_amount;
+        let instant_amount = payment.instant_amount;
+        let merchant = payment.merchant;
+
         release(
             &ctx.accounts.token_program,
             &ctx.accounts.escrow_vault,
             &ctx.accounts.buyer_token,
             &ctx.accounts.payment,
             ctx.accounts.buyer.to_account_info(),
-            amount,
+            escrowed_amount,
             order_id,
         )?;
+
+        if instant_amount > 0 {
+            require!(
+                *ctx.accounts.merchant_reserve.owner == crate::ID,
+                ErrorCode::InvalidReserve
+            );
+            let mut reserve: Account<MerchantReserve> =
+                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            require!(reserve.merchant == merchant, ErrorCode::InvalidReserve);
+            let vault: Account<TokenAccount> = Account::try_from(&ctx.accounts.reserve_vault)?;
+            require!(vault.owner == ctx.accounts.merchant_reserve.key(), ErrorCode::InvalidReserve);
+
+            // Made whole up to whatever the reserve actually still holds —
+            // a reserve already drained by other orders is a separate,
+            // documented shortfall case, not solved here.
+            let skimmed = instant_amount.min(vault.amount);
+            if skimmed > 0 {
+                let reserve_bump = reserve.bump;
+                let signer_seeds: &[&[u8]] = &[b"reserve", merchant.as_ref(), &[reserve_bump]];
+                token::transfer(
+                    CpiContext::new_with_signer(
+                        ctx.accounts.token_program.to_account_info(),
+                        Transfer {
+                            from: ctx.accounts.reserve_vault.to_account_info(),
+                            to: ctx.accounts.buyer_token.to_account_info(),
+                            authority: ctx.accounts.merchant_reserve.to_account_info(),
+                        },
+                        &[signer_seeds],
+                    ),
+                    skimmed,
+                )?;
+            }
+            reserve.locked_exposure = reserve.locked_exposure.saturating_sub(instant_amount);
+            reserve.exit(ctx.program_id)?;
+
+            emit!(ReserveSkimmed {
+                merchant,
+                order_id,
+                skimmed,
+            });
+        }
 
         let payment = &mut ctx.accounts.payment;
         payment.status = PaymentStatus::Reclaimed;
@@ -374,7 +483,7 @@ pub mod x402_scoring {
             buyer: payment.buyer,
             merchant: payment.merchant,
             order_id,
-            amount,
+            amount: payment.amount,
             fee: 0,
             outcome: PaymentStatus::Reclaimed,
         });
@@ -382,263 +491,7 @@ pub mod x402_scoring {
     }
 
     /// Reclaims the rent of a finished Payment account.
-    ///
-    /// x402 is built for micropayments, and an account left open forever costs
-    /// more rent than a small payment is worth. The order's history survives in
-    /// the events emitted above, which indexers read, so closing the account
-    /// loses nothing an archival node cannot reconstruct.
     pub fn close_payment(ctx: Context<ClosePayment>, order_id: u64) -> Result<()> {
-        let payment = &ctx.accounts.payment;
-        require!(
-            payment.status != PaymentStatus::EscrowHeld,
-            ErrorCode::PaymentStillOpen
-        );
-        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
-        Ok(())
-    }
-
-    /// Splits one order's cost across up to `MAX_POOL_CONTRIBUTORS` buyers,
-    /// each paying their own declared share from their own token account in
-    /// this same transaction.
-    ///
-    /// There is no single buyer to name on the resulting record, so
-    /// `PooledPayment` tracks a `coordinator` instead — one of the
-    /// contributors, playing the same role `buyer` plays on a normal
-    /// `Payment` for later settlement — plus every contributor's own
-    /// address and amount, so a refund or reclaim can pay each of them back
-    /// individually rather than handing everyone's money to one party.
-    pub fn initiate_pooled_payment(
-        ctx: Context<InitiatePooledPayment>,
-        order_id: u64,
-        timeout_seconds: i64,
-        amounts: Vec<u64>,
-    ) -> Result<()> {
-        require!(
-            (MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&timeout_seconds),
-            ErrorCode::InvalidTimeout
-        );
-        let contributor_count = amounts.len();
-        require!(contributor_count > 0, ErrorCode::InvalidPoolSize);
-        require!(
-            contributor_count <= MAX_POOL_CONTRIBUTORS,
-            ErrorCode::InvalidPoolSize
-        );
-        require!(
-            ctx.remaining_accounts.len() == contributor_count * ACCOUNTS_PER_CONTRIBUTION,
-            ErrorCode::InvalidPoolSize
-        );
-
-        let mint_key = ctx.accounts.mint.key();
-        let mut contributors = [Pubkey::default(); MAX_POOL_CONTRIBUTORS];
-        let mut contributor_amounts = [0u64; MAX_POOL_CONTRIBUTORS];
-        let mut total: u64 = 0;
-
-        for i in 0..contributor_count {
-            let amount = amounts[i];
-            require!(amount > 0, ErrorCode::InvalidAmount);
-
-            let base = i * ACCOUNTS_PER_CONTRIBUTION;
-            let contributor_info = &ctx.remaining_accounts[base];
-            let contributor_token_info = &ctx.remaining_accounts[base + 1];
-
-            // Each contributor authorizes their own transfer by co-signing
-            // this transaction; the SPL token CPI below would fail anyway
-            // if this were false, but checking it directly gives a clear
-            // error instead of an opaque CPI failure.
-            require!(contributor_info.is_signer, ErrorCode::InvalidBuyer);
-
-            let contributor_token: Account<TokenAccount> =
-                Account::try_from(contributor_token_info)?;
-            require!(
-                contributor_token.owner == contributor_info.key(),
-                ErrorCode::InvalidTokenOwner
-            );
-            require!(contributor_token.mint == mint_key, ErrorCode::InvalidMint);
-
-            token::transfer(
-                CpiContext::new(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from: contributor_token_info.clone(),
-                        to: ctx.accounts.escrow_vault.to_account_info(),
-                        authority: contributor_info.clone(),
-                    },
-                ),
-                amount,
-            )?;
-
-            contributors[i] = contributor_info.key();
-            contributor_amounts[i] = amount;
-            total = total
-                .checked_add(amount)
-                .ok_or(ErrorCode::ArithmeticOverflow)?;
-        }
-
-        let now = Clock::get()?.unix_timestamp;
-        let payment = &mut ctx.accounts.payment;
-        payment.coordinator = ctx.accounts.coordinator.key();
-        payment.merchant = ctx.accounts.merchant.key();
-        payment.mint = mint_key;
-        payment.order_id = order_id;
-        payment.amount = total;
-        payment.fee_amount = 0;
-        payment.status = PaymentStatus::EscrowHeld;
-        payment.created_at = now;
-        payment.expiry = now
-            .checked_add(timeout_seconds)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-        payment.bump = ctx.bumps.payment;
-        payment.vault_bump = ctx.bumps.escrow_vault;
-        payment.contributor_count = contributor_count as u8;
-        payment.contributors = contributors;
-        payment.contributor_amounts = contributor_amounts;
-
-        emit!(PooledPaymentInitiated {
-            coordinator: payment.coordinator,
-            merchant: payment.merchant,
-            mint: payment.mint,
-            order_id,
-            amount: total,
-            contributor_count: payment.contributor_count,
-            expiry: payment.expiry,
-        });
-        Ok(())
-    }
-
-    /// The coordinator confirms the pooled order arrived. Releases the
-    /// escrow to the merchant exactly like `confirm_delivery` — a merchant
-    /// payout does not care how many people funded the vault, only that it
-    /// holds the full amount.
-    pub fn confirm_pooled_delivery(
-        ctx: Context<ConfirmPooledDelivery>,
-        order_id: u64,
-    ) -> Result<()> {
-        let payment = &ctx.accounts.payment;
-        require!(
-            payment.status == PaymentStatus::EscrowHeld,
-            ErrorCode::InvalidPaymentStatus
-        );
-        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
-
-        let amount = payment.amount;
-        let fee = settlement_fee(amount)?;
-        let to_merchant = amount.checked_sub(fee).ok_or(ErrorCode::ArithmeticOverflow)?;
-
-        take_fee_pooled(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.treasury_token,
-            &ctx.accounts.payment,
-            fee,
-            order_id,
-        )?;
-        release_pooled(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.merchant_token,
-            &ctx.accounts.payment,
-            ctx.accounts.coordinator.to_account_info(),
-            to_merchant,
-            order_id,
-        )?;
-
-        let payment = &mut ctx.accounts.payment;
-        payment.status = PaymentStatus::Settled;
-        payment.fee_amount = fee;
-
-        emit!(PooledPaymentSettled {
-            coordinator: payment.coordinator,
-            merchant: payment.merchant,
-            order_id,
-            amount,
-            fee,
-            outcome: PaymentStatus::Settled,
-        });
-        Ok(())
-    }
-
-    /// Cancels a pooled order by mutual agreement: the merchant and the
-    /// coordinator both sign, and every contributor gets back exactly what
-    /// they put in, with no fee — same rule as `refund_escrow`, just fanned
-    /// out to everyone who funded the vault instead of a single buyer.
-    pub fn refund_pooled_escrow(ctx: Context<RefundPooledEscrow>, order_id: u64) -> Result<()> {
-        let payment = &ctx.accounts.payment;
-        require!(
-            payment.status == PaymentStatus::EscrowHeld,
-            ErrorCode::InvalidPaymentStatus
-        );
-        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
-
-        release_pooled_split(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.payment,
-            ctx.accounts.coordinator.to_account_info(),
-            ctx.remaining_accounts,
-            order_id,
-        )?;
-
-        let payment = &mut ctx.accounts.payment;
-        payment.status = PaymentStatus::Refunded;
-
-        emit!(PooledPaymentSettled {
-            coordinator: payment.coordinator,
-            merchant: payment.merchant,
-            order_id,
-            amount: payment.amount,
-            fee: 0,
-            outcome: PaymentStatus::Refunded,
-        });
-        Ok(())
-    }
-
-    /// No contributor delivered on, and none needs anyone's permission to
-    /// get their own money back: this is permissionless and time-gated
-    /// only, exactly like `reclaim_timeout`, except there is no single
-    /// buyer to privilege here — every contributor has an equal claim, so
-    /// each one is refunded their own recorded amount regardless of who
-    /// happens to submit this transaction.
-    pub fn reclaim_pooled_timeout(
-        ctx: Context<ReclaimPooledTimeout>,
-        order_id: u64,
-    ) -> Result<()> {
-        let payment = &ctx.accounts.payment;
-        require!(
-            payment.status == PaymentStatus::EscrowHeld,
-            ErrorCode::InvalidPaymentStatus
-        );
-        require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
-        require!(
-            Clock::get()?.unix_timestamp >= payment.expiry,
-            ErrorCode::ReclaimNotYetAvailable
-        );
-
-        release_pooled_split(
-            &ctx.accounts.token_program,
-            &ctx.accounts.escrow_vault,
-            &ctx.accounts.payment,
-            ctx.accounts.coordinator.to_account_info(),
-            ctx.remaining_accounts,
-            order_id,
-        )?;
-
-        let payment = &mut ctx.accounts.payment;
-        payment.status = PaymentStatus::Reclaimed;
-
-        emit!(PooledPaymentSettled {
-            coordinator: payment.coordinator,
-            merchant: payment.merchant,
-            order_id,
-            amount: payment.amount,
-            fee: 0,
-            outcome: PaymentStatus::Reclaimed,
-        });
-        Ok(())
-    }
-
-    /// Reclaims the rent of a finished pooled order record, same rule as
-    /// `close_payment`.
-    pub fn close_pooled_payment(ctx: Context<ClosePooledPayment>, order_id: u64) -> Result<()> {
         let payment = &ctx.accounts.payment;
         require!(
             payment.status != PaymentStatus::EscrowHeld,
@@ -649,11 +502,72 @@ pub mod x402_scoring {
     }
 }
 
-/// Moves `amount` out of the vault and closes it, signing as the Payment PDA.
-///
-/// Every release in this program goes through here so the signer seeds are
-/// written once: getting them wrong is the classic way an escrow either stops
-/// working or stops being safe.
+/// Shared by `confirm_delivery` and `finalize_claim`: release the escrowed
+/// portion (less the settlement fee, charged only on the escrowed portion —
+/// see `FEE_BPS`) to the merchant, unlock the merchant's reserve exposure
+/// for this order, and raise the buyer's standing if it has ever been
+/// opened.
+fn settle_fulfilled<'info>(
+    token_program: &Program<'info, Token>,
+    vault: &Account<'info, TokenAccount>,
+    merchant_token: &Account<'info, TokenAccount>,
+    treasury_token: &Account<'info, TokenAccount>,
+    payment: &mut Account<'info, Payment>,
+    rent_destination: AccountInfo<'info>,
+    merchant_reserve: &UncheckedAccount<'info>,
+    buyer_standing: &UncheckedAccount<'info>,
+    order_id: u64,
+) -> Result<()> {
+    let escrowed_amount = payment.escrowed_amount;
+    let instant_amount = payment.instant_amount;
+    let fee = settlement_fee(escrowed_amount)?;
+    let to_merchant = escrowed_amount
+        .checked_sub(fee)
+        .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+    take_fee(token_program, vault, treasury_token, payment, fee, order_id)?;
+    release(
+        token_program,
+        vault,
+        merchant_token,
+        payment,
+        rent_destination,
+        to_merchant,
+        order_id,
+    )?;
+
+    if instant_amount > 0 && *merchant_reserve.owner == crate::ID {
+        let mut reserve: Account<MerchantReserve> = Account::try_from(merchant_reserve)?;
+        if reserve.merchant == payment.merchant {
+            reserve.locked_exposure = reserve.locked_exposure.saturating_sub(instant_amount);
+            reserve.exit(&crate::ID)?;
+        }
+    }
+
+    if *buyer_standing.owner == crate::ID {
+        let mut standing: Account<BuyerStanding> = Account::try_from(buyer_standing)?;
+        if standing.buyer == payment.buyer {
+            standing.settled_count = standing.settled_count.saturating_add(1);
+            standing.exit(&crate::ID)?;
+        }
+    }
+
+    payment.status = PaymentStatus::Settled;
+    payment.fee_amount = fee;
+
+    emit!(PaymentSettled {
+        buyer: payment.buyer,
+        merchant: payment.merchant,
+        order_id,
+        amount: payment.amount,
+        fee,
+        outcome: PaymentStatus::Settled,
+    });
+    Ok(())
+}
+
+/// Moves `amount` out of the vault and closes it, signing as the Payment
+/// PDA. Every release in this program goes through here.
 fn release<'info>(
     token_program: &Program<'info, Token>,
     vault: &Account<'info, TokenAccount>,
@@ -690,7 +604,6 @@ fn release<'info>(
         )?;
     }
 
-    // The vault has done its job; return its rent to whoever funded it.
     token::close_account(CpiContext::new_with_signer(
         token_program.to_account_info(),
         CloseAccount {
@@ -703,9 +616,9 @@ fn release<'info>(
     Ok(())
 }
 
-/// Moves the settlement fee out of the vault, leaving the rest for the merchant.
-/// Kept separate from `release` because `release` also closes the vault, and the
-/// fee has to be paid while it is still open.
+/// Moves the settlement fee out of the vault, leaving the rest for the
+/// merchant. Kept separate from `release` because `release` also closes the
+/// vault, and the fee has to be paid while it is still open.
 fn take_fee<'info>(
     token_program: &Program<'info, Token>,
     vault: &Account<'info, TokenAccount>,
@@ -742,175 +655,13 @@ fn take_fee<'info>(
     )
 }
 
-/// The settlement fee for an order. Rounds down, so a payment too small to
-/// carry a fee simply pays none rather than being rejected.
+/// The settlement fee for an order's escrowed portion. Rounds down.
 fn settlement_fee(amount: u64) -> Result<u64> {
     let fee = (amount as u128)
         .checked_mul(FEE_BPS as u128)
         .ok_or(ErrorCode::ArithmeticOverflow)?
         / 10_000u128;
     Ok(fee as u64)
-}
-
-/// `release` for a `PooledPayment` — identical logic, different seed prefix
-/// and field name (`coordinator` instead of `buyer`), since a pooled order
-/// has no single buyer to derive its PDA from.
-fn release_pooled<'info>(
-    token_program: &Program<'info, Token>,
-    vault: &Account<'info, TokenAccount>,
-    destination: &Account<'info, TokenAccount>,
-    payment: &Account<'info, PooledPayment>,
-    rent_destination: AccountInfo<'info>,
-    amount: u64,
-    order_id: u64,
-) -> Result<()> {
-    let coordinator = payment.coordinator;
-    let merchant = payment.merchant;
-    let bump = payment.bump;
-    let order_id_bytes = order_id.to_le_bytes();
-    let signer_seeds: &[&[u8]] = &[
-        b"pooled_payment",
-        coordinator.as_ref(),
-        merchant.as_ref(),
-        &order_id_bytes,
-        &[bump],
-    ];
-
-    if amount > 0 {
-        token::transfer(
-            CpiContext::new_with_signer(
-                token_program.to_account_info(),
-                Transfer {
-                    from: vault.to_account_info(),
-                    to: destination.to_account_info(),
-                    authority: payment.to_account_info(),
-                },
-                &[signer_seeds],
-            ),
-            amount,
-        )?;
-    }
-
-    token::close_account(CpiContext::new_with_signer(
-        token_program.to_account_info(),
-        CloseAccount {
-            account: vault.to_account_info(),
-            destination: rent_destination,
-            authority: payment.to_account_info(),
-        },
-        &[signer_seeds],
-    ))?;
-    Ok(())
-}
-
-/// `take_fee` for a `PooledPayment` — see `release_pooled`.
-fn take_fee_pooled<'info>(
-    token_program: &Program<'info, Token>,
-    vault: &Account<'info, TokenAccount>,
-    treasury_token: &Account<'info, TokenAccount>,
-    payment: &Account<'info, PooledPayment>,
-    fee: u64,
-    order_id: u64,
-) -> Result<()> {
-    if fee == 0 {
-        return Ok(());
-    }
-    let coordinator = payment.coordinator;
-    let merchant = payment.merchant;
-    let bump = payment.bump;
-    let order_id_bytes = order_id.to_le_bytes();
-    let signer_seeds: &[&[u8]] = &[
-        b"pooled_payment",
-        coordinator.as_ref(),
-        merchant.as_ref(),
-        &order_id_bytes,
-        &[bump],
-    ];
-    token::transfer(
-        CpiContext::new_with_signer(
-            token_program.to_account_info(),
-            Transfer {
-                from: vault.to_account_info(),
-                to: treasury_token.to_account_info(),
-                authority: payment.to_account_info(),
-            },
-            &[signer_seeds],
-        ),
-        fee,
-    )
-}
-
-/// Refunds every contributor their own recorded amount out of the vault,
-/// then closes it, signing as the `PooledPayment` PDA. Used by both
-/// `refund_pooled_escrow` and `reclaim_pooled_timeout` — the only
-/// difference between those two is who is allowed to call this and when;
-/// once called, the money always goes back to exactly where it came from.
-/// `contributor_token_accounts` must list each contributor's own token
-/// account in the same order `payment.contributors` was recorded in.
-fn release_pooled_split<'info>(
-    token_program: &Program<'info, Token>,
-    vault: &Account<'info, TokenAccount>,
-    payment: &Account<'info, PooledPayment>,
-    rent_destination: AccountInfo<'info>,
-    contributor_token_accounts: &[AccountInfo<'info>],
-    order_id: u64,
-) -> Result<()> {
-    let contributor_count = payment.contributor_count as usize;
-    require!(
-        contributor_token_accounts.len() == contributor_count,
-        ErrorCode::InvalidPoolSize
-    );
-
-    let coordinator = payment.coordinator;
-    let merchant = payment.merchant;
-    let bump = payment.bump;
-    let order_id_bytes = order_id.to_le_bytes();
-    let signer_seeds: &[&[u8]] = &[
-        b"pooled_payment",
-        coordinator.as_ref(),
-        merchant.as_ref(),
-        &order_id_bytes,
-        &[bump],
-    ];
-
-    for i in 0..contributor_count {
-        let expected_contributor = payment.contributors[i];
-        let amount = payment.contributor_amounts[i];
-        let contributor_token_info = &contributor_token_accounts[i];
-
-        let contributor_token: Account<TokenAccount> = Account::try_from(contributor_token_info)?;
-        require!(
-            contributor_token.owner == expected_contributor,
-            ErrorCode::InvalidTokenOwner
-        );
-        require!(contributor_token.mint == payment.mint, ErrorCode::InvalidMint);
-
-        if amount > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    token_program.to_account_info(),
-                    Transfer {
-                        from: vault.to_account_info(),
-                        to: contributor_token_info.clone(),
-                        authority: payment.to_account_info(),
-                    },
-                    &[signer_seeds],
-                ),
-                amount,
-            )?;
-        }
-    }
-
-    token::close_account(CpiContext::new_with_signer(
-        token_program.to_account_info(),
-        CloseAccount {
-            account: vault.to_account_info(),
-            destination: rent_destination,
-            authority: payment.to_account_info(),
-        },
-        &[signer_seeds],
-    ))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -925,15 +676,23 @@ pub struct Payment {
     /// The SPL mint this order settles in.
     pub mint: Pubkey,
     pub order_id: u64,
-    /// The full order price. All of it is escrowed.
+    /// The full order price.
     pub amount: u64,
-    /// The settlement fee actually charged. Zero until the order settles, and
-    /// zero forever on a refund or reclaim.
+    /// The slice of `amount` paid straight to the merchant at initiation.
+    pub instant_amount: u64,
+    /// The slice of `amount` held in the vault. `amount == instant_amount +
+    /// escrowed_amount` always.
+    pub escrowed_amount: u64,
+    /// The settlement fee actually charged, on the escrowed portion only.
+    /// Zero until the order settles.
     pub fee_amount: u64,
     pub status: PaymentStatus,
     pub created_at: i64,
     /// Reclaim becomes available at this unix timestamp.
     pub expiry: i64,
+    /// Unix timestamp of an active, unopposed `claim_fulfillment`. Zero
+    /// means no active claim.
+    pub claimed_at: i64,
     pub bump: u8,
     pub vault_bump: u8,
 }
@@ -942,41 +701,34 @@ pub struct Payment {
 pub enum PaymentStatus {
     EscrowHeld,
     Settled,
-    Refunded,
     Reclaimed,
 }
 
-/// A `Payment`-equivalent for an order funded by multiple buyers instead of
-/// one. There is no single `buyer` field — `coordinator` plays that role
-/// for settlement (confirming or reclaiming), while `contributors` and
-/// `contributor_amounts` record exactly who funded the vault and how much,
-/// so a refund or reclaim can pay each of them back individually.
+/// A merchant's posted collateral. Its real funds live in the paired
+/// `reserve_vault` token account; this record only tracks how much of that
+/// balance is currently locked, backing outstanding instant payments.
 #[account]
 #[derive(InitSpace)]
-pub struct PooledPayment {
-    pub coordinator: Pubkey,
+pub struct MerchantReserve {
     pub merchant: Pubkey,
-    /// The SPL mint this order settles in.
     pub mint: Pubkey,
-    pub order_id: u64,
-    /// The full order price: the sum of every contributor's own amount.
-    pub amount: u64,
-    /// The settlement fee actually charged. Zero until the order settles,
-    /// and zero forever on a refund or reclaim.
-    pub fee_amount: u64,
-    pub status: PaymentStatus,
-    pub created_at: i64,
-    /// Reclaim becomes available at this unix timestamp.
-    pub expiry: i64,
+    pub locked_exposure: u64,
     pub bump: u8,
     pub vault_bump: u8,
-    pub contributor_count: u8,
-    pub contributors: [Pubkey; MAX_POOL_CONTRIBUTORS],
-    pub contributor_amounts: [u64; MAX_POOL_CONTRIBUTORS],
+}
+
+/// A buyer's history. The only thing this is used for is gating instant-
+/// payment eligibility on future orders — never a trust or fraud score.
+#[account]
+#[derive(InitSpace)]
+pub struct BuyerStanding {
+    pub buyer: Pubkey,
+    pub settled_count: u32,
+    pub bump: u8,
 }
 
 // ---------------------------------------------------------------------------
-// Events — the order history, once Payment accounts are closed.
+// Events
 // ---------------------------------------------------------------------------
 
 #[event]
@@ -986,6 +738,8 @@ pub struct PaymentInitiated {
     pub mint: Pubkey,
     pub order_id: u64,
     pub amount: u64,
+    pub instant_amount: u64,
+    pub escrowed_amount: u64,
     pub expiry: i64,
 }
 
@@ -1000,29 +754,150 @@ pub struct PaymentSettled {
 }
 
 #[event]
-pub struct PooledPaymentInitiated {
-    pub coordinator: Pubkey,
+pub struct FulfillmentClaimed {
+    pub buyer: Pubkey,
     pub merchant: Pubkey,
-    pub mint: Pubkey,
     pub order_id: u64,
-    pub amount: u64,
-    pub contributor_count: u8,
-    pub expiry: i64,
+    pub claimed_at: i64,
 }
 
 #[event]
-pub struct PooledPaymentSettled {
-    pub coordinator: Pubkey,
+pub struct ClaimDisputed {
+    pub buyer: Pubkey,
     pub merchant: Pubkey,
     pub order_id: u64,
+}
+
+#[event]
+pub struct ReserveOpened {
+    pub merchant: Pubkey,
+    pub mint: Pubkey,
+}
+
+#[event]
+pub struct ReservePosted {
+    pub merchant: Pubkey,
     pub amount: u64,
-    pub fee: u64,
-    pub outcome: PaymentStatus,
+}
+
+#[event]
+pub struct ReserveWithdrawn {
+    pub merchant: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct ReserveSkimmed {
+    pub merchant: Pubkey,
+    pub order_id: u64,
+    pub skimmed: u64,
 }
 
 // ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
+
+#[derive(Accounts)]
+pub struct OpenReserve<'info> {
+    #[account(
+        init,
+        payer = merchant,
+        space = 8 + MerchantReserve::INIT_SPACE,
+        seeds = [b"reserve", merchant.key().as_ref()],
+        bump
+    )]
+    pub reserve: Box<Account<'info, MerchantReserve>>,
+
+    #[account(mut)]
+    pub merchant: Signer<'info>,
+
+    #[account(
+        init,
+        payer = merchant,
+        seeds = [b"reserve_vault", reserve.key().as_ref()],
+        bump,
+        token::mint = mint,
+        token::authority = reserve,
+    )]
+    pub reserve_vault: Box<Account<'info, TokenAccount>>,
+
+    pub mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct PostReserve<'info> {
+    #[account(
+        seeds = [b"reserve", merchant.key().as_ref()],
+        bump = reserve.bump,
+    )]
+    pub reserve: Box<Account<'info, MerchantReserve>>,
+
+    pub merchant: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"reserve_vault", reserve.key().as_ref()],
+        bump = reserve.vault_bump,
+    )]
+    pub reserve_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = merchant_token.owner == merchant.key() @ ErrorCode::InvalidTokenOwner,
+        constraint = merchant_token.mint == reserve.mint @ ErrorCode::InvalidMint,
+    )]
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawReserve<'info> {
+    #[account(
+        seeds = [b"reserve", merchant.key().as_ref()],
+        bump = reserve.bump,
+    )]
+    pub reserve: Box<Account<'info, MerchantReserve>>,
+
+    pub merchant: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"reserve_vault", reserve.key().as_ref()],
+        bump = reserve.vault_bump,
+    )]
+    pub reserve_vault: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = merchant_token.owner == merchant.key() @ ErrorCode::InvalidTokenOwner,
+        constraint = merchant_token.mint == reserve.mint @ ErrorCode::InvalidMint,
+    )]
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct RegisterBuyer<'info> {
+    #[account(
+        init,
+        payer = buyer,
+        space = 8 + BuyerStanding::INIT_SPACE,
+        seeds = [b"standing", buyer.key().as_ref()],
+        bump
+    )]
+    pub standing: Box<Account<'info, BuyerStanding>>,
+
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
 
 #[derive(Accounts)]
 #[instruction(amount: u64, order_id: u64)]
@@ -1036,8 +911,6 @@ pub struct InitiatePayment<'info> {
     )]
     pub payment: Box<Account<'info, Payment>>,
 
-    /// The merchant being paid. Only their address is needed — this program
-    /// keeps no merchant record of any kind.
     /// CHECK: used solely as a PDA seed and stored for later settlement.
     pub merchant: UncheckedAccount<'info>,
 
@@ -1052,6 +925,13 @@ pub struct InitiatePayment<'info> {
     pub buyer_token: Box<Account<'info, TokenAccount>>,
 
     #[account(
+        mut,
+        constraint = merchant_token.owner == merchant.key() @ ErrorCode::InvalidTokenOwner,
+        constraint = merchant_token.mint == mint.key() @ ErrorCode::InvalidMint,
+    )]
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
+
+    #[account(
         init,
         payer = buyer,
         seeds = [b"vault", payment.key().as_ref()],
@@ -1060,6 +940,21 @@ pub struct InitiatePayment<'info> {
         token::authority = payment,
     )]
     pub escrow_vault: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: may or may not exist yet. Read manually — see
+    /// `initiate_payment`'s body — because a merchant is not required to
+    /// have opened a reserve to receive payment at all, only to be eligible
+    /// for the instant portion.
+    #[account(seeds = [b"reserve", merchant.key().as_ref()], bump)]
+    pub merchant_reserve: UncheckedAccount<'info>,
+
+    /// CHECK: the reserve's vault, only read when `merchant_reserve` exists.
+    pub reserve_vault: UncheckedAccount<'info>,
+
+    /// CHECK: may or may not exist yet — see `merchant_reserve` above, same
+    /// reasoning for the buyer's own standing.
+    #[account(seeds = [b"standing", buyer.key().as_ref()], bump)]
+    pub buyer_standing: UncheckedAccount<'info>,
 
     pub mint: Box<Account<'info, Mint>>,
 
@@ -1095,8 +990,6 @@ pub struct ConfirmDelivery<'info> {
     )]
     pub merchant_token: Box<Account<'info, TokenAccount>>,
 
-    /// Receives the settlement fee. Constrained to the compiled-in treasury, so
-    /// the caller cannot redirect the fee to themselves.
     #[account(
         mut,
         constraint = treasury_token.owner == TREASURY @ ErrorCode::InvalidTreasury,
@@ -1104,38 +997,58 @@ pub struct ConfirmDelivery<'info> {
     )]
     pub treasury_token: Box<Account<'info, TokenAccount>>,
 
-    pub token_program: Program<'info, Token>,
-}
+    /// CHECK: only touched if `payment.instant_amount > 0`, in which case it
+    /// is guaranteed to already exist.
+    #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
+    pub merchant_reserve: UncheckedAccount<'info>,
 
-/// Fixed accounts for `batch_confirm_delivery`. Everything order-specific
-/// arrives via `ctx.remaining_accounts` instead — see that function's doc
-/// comment for the per-order account layout.
-#[derive(Accounts)]
-pub struct BatchConfirmDelivery<'info> {
-    #[account(mut)]
-    pub buyer: Signer<'info>,
+    /// CHECK: only touched if it already exists — see `register_buyer`.
+    #[account(seeds = [b"standing", buyer.key().as_ref()], bump)]
+    pub buyer_standing: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 #[instruction(order_id: u64)]
-pub struct RefundEscrow<'info> {
+pub struct ClaimFulfillment<'info> {
     #[account(
         mut,
-        seeds = [b"payment", buyer.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
+        seeds = [b"payment", payment.buyer.as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
         bump = payment.bump,
     )]
     pub payment: Box<Account<'info, Payment>>,
 
-    /// The refund is the merchant's own decision, so they sign it. Without this
-    /// a buyer could take delivery and then pull the money back at will.
     #[account(constraint = merchant.key() == payment.merchant @ ErrorCode::InvalidMerchant)]
     pub merchant: Signer<'info>,
+}
 
-    /// The buyer signs too: a refund is a cancellation both sides agree to.
-    #[account(mut, constraint = buyer.key() == payment.buyer @ ErrorCode::InvalidBuyer)]
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct DisputeClaim<'info> {
+    #[account(
+        mut,
+        seeds = [b"payment", buyer.key().as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+    )]
+    pub payment: Box<Account<'info, Payment>>,
+
+    #[account(constraint = buyer.key() == payment.buyer @ ErrorCode::InvalidBuyer)]
     pub buyer: Signer<'info>,
+}
+
+/// Fixed accounts for `finalize_claim`. No signer required beyond whoever
+/// pays this transaction's own network fee — the dispute window already
+/// closing is the authorization.
+#[derive(Accounts)]
+#[instruction(order_id: u64)]
+pub struct FinalizeClaim<'info> {
+    #[account(
+        mut,
+        seeds = [b"payment", payment.buyer.as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
+        bump = payment.bump,
+    )]
+    pub payment: Box<Account<'info, Payment>>,
 
     #[account(
         mut,
@@ -1144,12 +1057,32 @@ pub struct RefundEscrow<'info> {
     )]
     pub escrow_vault: Box<Account<'info, TokenAccount>>,
 
+    /// CHECK: the merchant being paid; only used as a rent destination and
+    /// for the merchant_token/reserve constraints below.
+    #[account(mut, constraint = merchant.key() == payment.merchant @ ErrorCode::InvalidMerchant)]
+    pub merchant: UncheckedAccount<'info>,
+
     #[account(
         mut,
-        constraint = buyer_token.owner == payment.buyer @ ErrorCode::InvalidTokenOwner,
-        constraint = buyer_token.mint == payment.mint @ ErrorCode::InvalidMint,
+        constraint = merchant_token.owner == payment.merchant @ ErrorCode::InvalidTokenOwner,
+        constraint = merchant_token.mint == payment.mint @ ErrorCode::InvalidMint,
     )]
-    pub buyer_token: Box<Account<'info, TokenAccount>>,
+    pub merchant_token: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = treasury_token.owner == TREASURY @ ErrorCode::InvalidTreasury,
+        constraint = treasury_token.mint == payment.mint @ ErrorCode::InvalidMint,
+    )]
+    pub treasury_token: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: only touched if `payment.instant_amount > 0`.
+    #[account(seeds = [b"reserve", payment.merchant.as_ref()], bump)]
+    pub merchant_reserve: UncheckedAccount<'info>,
+
+    /// CHECK: only touched if it already exists.
+    #[account(seeds = [b"standing", payment.buyer.as_ref()], bump)]
+    pub buyer_standing: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -1181,6 +1114,14 @@ pub struct ReclaimTimeout<'info> {
     )]
     pub buyer_token: Box<Account<'info, TokenAccount>>,
 
+    /// CHECK: only touched if `payment.instant_amount > 0`.
+    #[account(mut, seeds = [b"reserve", payment.merchant.as_ref()], bump)]
+    pub merchant_reserve: UncheckedAccount<'info>,
+
+    /// CHECK: only touched if `payment.instant_amount > 0`.
+    #[account(mut)]
+    pub reserve_vault: UncheckedAccount<'info>,
+
     pub token_program: Program<'info, Token>,
 }
 
@@ -1197,161 +1138,6 @@ pub struct ClosePayment<'info> {
 
     #[account(mut, constraint = buyer.key() == payment.buyer @ ErrorCode::InvalidBuyer)]
     pub buyer: Signer<'info>,
-}
-
-#[derive(Accounts)]
-#[instruction(order_id: u64)]
-pub struct InitiatePooledPayment<'info> {
-    #[account(
-        init,
-        payer = coordinator,
-        space = 8 + PooledPayment::INIT_SPACE,
-        seeds = [b"pooled_payment", coordinator.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub payment: Box<Account<'info, PooledPayment>>,
-
-    /// The merchant being paid. Only their address is needed, same as
-    /// `InitiatePayment`.
-    /// CHECK: used solely as a PDA seed and stored for later settlement.
-    pub merchant: UncheckedAccount<'info>,
-
-    /// One of the contributors, standing in for a single buyer on
-    /// everything that follows (`confirm_pooled_delivery`,
-    /// `refund_pooled_escrow`). Pays for this account's rent.
-    #[account(mut)]
-    pub coordinator: Signer<'info>,
-
-    #[account(
-        init,
-        payer = coordinator,
-        seeds = [b"pooled_vault", payment.key().as_ref()],
-        bump,
-        token::mint = mint,
-        token::authority = payment,
-    )]
-    pub escrow_vault: Box<Account<'info, TokenAccount>>,
-
-    pub mint: Box<Account<'info, Mint>>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-#[instruction(order_id: u64)]
-pub struct ConfirmPooledDelivery<'info> {
-    #[account(
-        mut,
-        seeds = [b"pooled_payment", coordinator.key().as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
-        bump = payment.bump,
-    )]
-    pub payment: Box<Account<'info, PooledPayment>>,
-
-    #[account(mut)]
-    pub coordinator: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"pooled_vault", payment.key().as_ref()],
-        bump = payment.vault_bump,
-    )]
-    pub escrow_vault: Box<Account<'info, TokenAccount>>,
-
-    #[account(
-        mut,
-        constraint = merchant_token.owner == payment.merchant @ ErrorCode::InvalidTokenOwner,
-        constraint = merchant_token.mint == payment.mint @ ErrorCode::InvalidMint,
-    )]
-    pub merchant_token: Box<Account<'info, TokenAccount>>,
-
-    /// Receives the settlement fee. Constrained to the compiled-in treasury,
-    /// same as `ConfirmDelivery`.
-    #[account(
-        mut,
-        constraint = treasury_token.owner == TREASURY @ ErrorCode::InvalidTreasury,
-        constraint = treasury_token.mint == payment.mint @ ErrorCode::InvalidMint,
-    )]
-    pub treasury_token: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-/// Mutual, instant cancellation for a pooled order: the merchant and the
-/// coordinator both sign, mirroring `RefundEscrow`. Every contributor's own
-/// token account arrives via `remaining_accounts`, in the same order
-/// `payment.contributors` was recorded in.
-#[derive(Accounts)]
-#[instruction(order_id: u64)]
-pub struct RefundPooledEscrow<'info> {
-    #[account(
-        mut,
-        seeds = [b"pooled_payment", coordinator.key().as_ref(), merchant.key().as_ref(), order_id.to_le_bytes().as_ref()],
-        bump = payment.bump,
-    )]
-    pub payment: Box<Account<'info, PooledPayment>>,
-
-    /// The refund is the merchant's own decision, so they sign it, same as
-    /// `RefundEscrow`.
-    #[account(constraint = merchant.key() == payment.merchant @ ErrorCode::InvalidMerchant)]
-    pub merchant: Signer<'info>,
-
-    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
-    pub coordinator: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"pooled_vault", payment.key().as_ref()],
-        bump = payment.vault_bump,
-    )]
-    pub escrow_vault: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-/// Fixed accounts for `reclaim_pooled_timeout`. No signer is required: the
-/// clock is the only authorization, and every contributor's own token
-/// account (via `remaining_accounts`) can only ever receive that same
-/// contributor's own recorded amount back.
-#[derive(Accounts)]
-#[instruction(order_id: u64)]
-pub struct ReclaimPooledTimeout<'info> {
-    #[account(
-        mut,
-        seeds = [b"pooled_payment", payment.coordinator.as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
-        bump = payment.bump,
-    )]
-    pub payment: Box<Account<'info, PooledPayment>>,
-
-    /// CHECK: only the vault's rent destination once closed; constrained to
-    /// the address already recorded on the payment.
-    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
-    pub coordinator: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"pooled_vault", payment.key().as_ref()],
-        bump = payment.vault_bump,
-    )]
-    pub escrow_vault: Box<Account<'info, TokenAccount>>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-#[instruction(order_id: u64)]
-pub struct ClosePooledPayment<'info> {
-    #[account(
-        mut,
-        seeds = [b"pooled_payment", coordinator.key().as_ref(), payment.merchant.as_ref(), order_id.to_le_bytes().as_ref()],
-        bump = payment.bump,
-        close = coordinator,
-    )]
-    pub payment: Box<Account<'info, PooledPayment>>,
-
-    #[account(mut, constraint = coordinator.key() == payment.coordinator @ ErrorCode::InvalidCoordinator)]
-    pub coordinator: Signer<'info>,
 }
 
 #[error_code]
@@ -1380,10 +1166,16 @@ pub enum ErrorCode {
     PaymentStillOpen,
     #[msg("Arithmetic overflow")]
     ArithmeticOverflow,
-    #[msg("Batch must contain 1 to MAX_BATCH_SIZE orders' worth of accounts, 4 per order")]
-    InvalidBatchSize,
-    #[msg("Pooled payment must have 1 to MAX_POOL_CONTRIBUTORS contributors, with matching accounts")]
-    InvalidPoolSize,
-    #[msg("Signer is not the coordinator on this pooled payment")]
-    InvalidCoordinator,
+    #[msg("Reserve account does not match the expected merchant, mint, or vault")]
+    InvalidReserve,
+    #[msg("Withdrawal exceeds the reserve's currently-available (unlocked) balance")]
+    InsufficientReserve,
+    #[msg("Standing account does not match the expected buyer")]
+    InvalidStanding,
+    #[msg("This order already has an active fulfillment claim")]
+    AlreadyClaimed,
+    #[msg("This order has no active fulfillment claim")]
+    NoActiveClaim,
+    #[msg("The claim's dispute window has not yet elapsed")]
+    ClaimNotYetFinalizable,
 }

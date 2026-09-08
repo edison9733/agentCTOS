@@ -95,9 +95,10 @@ anchor build
 anchor test
 ```
 
-Expect **9 passing** in about two minutes. One test genuinely sleeps 62
-seconds — the program enforces a 60-second minimum escrow timeout, and that
-test waits it out to prove the reclaim path really is time-gated. That's not a
+Expect **14 passing** in about two and a half minutes. Two tests genuinely
+sleep 62 seconds each — the program enforces a 60-second minimum escrow
+timeout, and those tests wait it out to prove the reclaim path really is
+time-gated. That's not a
 hang.
 
 `anchor test` starts its own local validator, so it costs no devnet SOL and
@@ -112,8 +113,8 @@ export ANCHOR_PROVIDER_URL="https://api.devnet.solana.com"
 npm run demo
 ```
 
-Four acts, ~2 minutes. Each states a claim, then proves it with a real devnet
-transaction and re-reads the result from the program's own accounts.
+Five acts, ~2.5 minutes. Each states a claim, then proves it with a real
+devnet transaction and re-reads the result from the program's own accounts.
 
 **If you hit `429 Too Many Requests`,** the public devnet RPC is throttling
 you. Get a free key at [helius.dev](https://helius.dev) and use it instead:
@@ -128,7 +129,7 @@ the URL with `no matches found`.
 
 ### Presenting it
 
-Act 4 waits out the remaining escrow timeout, which is ~45 seconds of a
+Act 5 waits out the remaining escrow timeout, which is ~1 minute of a
 progress line and nothing else. Two ways to handle that:
 
 - **Run it once before you present** and leave the finished output on screen.
@@ -160,28 +161,26 @@ token balances and the settlement fee along the way.
 
 | Command | What it shows |
 |---|---|
-| `npm run pay -- --amount 25` | The happy path. Fully escrowed, released on confirmation, 0.50% fee. |
-| `npm run pay -- --amount 25 --settle refund` | Cancelled by mutual agreement; the buyer is repaid in full, no fee. |
-| `npm run pay -- --amount 5 --settle reclaim --timeout 60` | The rug. Merchant never delivers; after 60s the buyer takes the money back **with no merchant signature**. |
+| `npm run pay -- --amount 25` | No reserve, no history: full escrow, released on confirmation, 0.50% fee. |
+| `npm run pay -- --amount 60 --reserve 100 --register --settle confirm` | Instant payment, backed by real merchant collateral. |
+| `npm run pay -- --amount 5 --settle reclaim --timeout 60` | The rug. Merchant never delivers; after 60s the buyer takes the money back **with no merchant signature**, and any instant portion is skimmed from the merchant's own reserve. |
+| `npm run pay -- --amount 25 --settle claim` | The merchant claims fulfillment without the buyer confirming, starting the 24-hour dispute window. |
 | `npm run pay -- --amount 25 --settle hold` | Leaves the escrow open so you can inspect the vault on Explorer. |
 
-### The two rules worth showing
+### The rule worth showing
 
-A refund needs **both** signatures, so neither side can reverse a payment
-alone:
-
-```bash
-npm run pay -- --amount 25 --settle refund
-```
-
-A reclaim needs **only the buyer**, but only after the deadline:
+There is no mutual-refund path anymore — it was removed because it let a
+buyer walk away penalty-free at the merchant's expense. Every order now
+resolves exactly one of two ways: the buyer confirms, or the clock runs out.
 
 ```bash
 npm run pay -- --amount 5 --settle reclaim --timeout 60
 ```
 
-Together those are the whole design: an instant reversal needs both parties to
-agree, and anything one party can do alone has to wait for the clock.
+A reclaim needs **only the buyer**, but only after the deadline — and it is
+also what makes an instant payment collateralized rather than a free pass:
+it skims the merchant's own reserve to cover whatever was already paid
+instantly.
 
 ---
 
@@ -256,6 +255,6 @@ solana program extend <PROGRAM_ID> 20000 --url https://api.devnet.solana.com
 | `invalid account data for instruction` right after startup | An RPC node that hasn't caught up. Both scripts already confirm at `"confirmed"` to prevent this; if you wrote your own script, don't use Anchor's default `"processed"`. |
 | `Blockhash expired` during deploy | Devnet congestion. Add `--with-compute-unit-price 50000`. |
 | `account data too small for instruction` | `solana program extend` (step 8). |
-| `insufficient lamports` on register | The merchant owner pays its own PDA rent. Fund it before registering. |
+| `insufficient lamports` on `open_reserve` or `register_buyer` | The merchant or buyer pays its own PDA rent. Fund the wallet before calling either. |
 | `no matches found: https://...` | zsh globbing the `?` in the URL. Quote it. |
 | `Test validator does not look started` | Read `.anchor/test-ledger/test-ledger-log.txt` — it names the real reason. |

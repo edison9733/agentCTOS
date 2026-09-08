@@ -36,7 +36,7 @@ anchor build
 anchor test
 ```
 
-Expect **13 passing**, about two and a half minutes. Two tests really do
+Expect **14 passing**, about two and a half minutes. Two tests really do
 sleep 62 seconds each — the program enforces a 60-second minimum escrow
 timeout and those tests wait it out rather than faking the clock.
 
@@ -44,9 +44,10 @@ timeout and those tests wait it out rather than faking the clock.
 npm run demo 2>&1 | tee demo-output.txt
 ```
 
-About two minutes. Leaves the full transcript on screen *and* in
+About two and a half minutes. Leaves the full transcript on screen *and* in
 `demo-output.txt`. **This is your primary artifact.** Open one Explorer link
-from the output — the rugged order's Payment account — and leave that tab ready.
+from the output — the rugged order's Payment account — and leave that tab
+ready.
 
 ---
 
@@ -62,11 +63,12 @@ If you'd rather run it live:
 npm run demo
 ```
 
-Act 4 pauses about 45 seconds waiting out the escrow expiry. That pause is
-the most convincing part of the demo if you narrate it:
+Act 5 pauses about a minute waiting out the escrow expiry. That pause is the
+most convincing part of the demo if you narrate it:
 
-> "The merchant can't stop this clock. When it expires the buyer takes the
-> money back — and the merchant's signature is nowhere in that transaction."
+> "The rugger already got paid instantly, out of its own posted collateral.
+> When this clock expires, that same collateral is what pays the buyer
+> back — and the merchant's signature is nowhere in that transaction."
 
 ---
 
@@ -84,25 +86,25 @@ recovers the money. Watch the signer list: only the buyer.
 > "The merchant was not asked. They could not object, could not stall, could
 > not extend the deadline. That is the whole guarantee."
 
-Then the counterpart — why this is not just a buyer-favouring system:
+Then show the part that's new — instant payment backed by real collateral:
 
 ```bash
-npm run pay -- --amount 25 --settle refund
+npm run pay -- --amount 60 --reserve 100 --register --settle confirm
 ```
 
-A refund needs both signatures. Say why:
-
-> "If the buyer could refund alone, they would take delivery and pull the money
-> back. An instant reversal needs both parties. Anything one party does alone
-> has to wait for the clock."
+> "This merchant posted 100 tokens of its own collateral before this order
+> even started. The buyer gets paid — sorry, the *merchant* gets paid —
+> the instant this transaction lands, because that collateral is already on
+> the hook if it doesn't deliver. Reputation didn't unlock this. Money did."
 
 ## Phase 4 — single scenarios on demand
 
 ```bash
-npm run pay -- --amount 25                                # pay, then confirm
-npm run pay -- --amount 25 --settle refund                # cancelled by mutual agreement
-npm run pay -- --amount 5 --settle reclaim --timeout 60   # the rug, in 60 seconds
-npm run pay -- --amount 25 --settle hold                  # leave escrow open to inspect
+npm run pay -- --amount 25                                         # no setup: full escrow, then confirm
+npm run pay -- --amount 60 --reserve 100 --register --settle confirm  # instant, backed by real collateral
+npm run pay -- --amount 5  --settle reclaim --timeout 60            # the rug, in 60 seconds
+npm run pay -- --amount 25 --settle claim                           # merchant claims fulfillment, no buyer confirmation
+npm run pay -- --amount 25 --settle hold                            # leave escrow open to inspect
 ```
 
 ---
@@ -119,6 +121,8 @@ solana account <PAYMENT_PDA> --url devnet
 Raw account bytes off devnet, with none of our code in the path. Then open the
 same account on Explorer, and the vault beside it — the vault's authority is
 the payment account itself, which is how you show there is no key to steal.
+The same is true of a merchant's reserve vault: its authority is the
+`MerchantReserve` PDA, not the merchant's own wallet.
 
 ---
 
@@ -130,6 +134,7 @@ the payment account itself, which is how you show there is no key to steal.
 | `Test validator does not look started` | `export COPYFILE_DISABLE=1 && rm -rf .anchor/test-ledger test-ledger` |
 | `no matches found: https://...` | zsh globbed the `?`. Quote the URL. |
 | `--merchant also needs --mint` | This program keeps no merchant record, so the token has to be named explicitly. |
+| `--reserve needs a generated merchant` | This script can only post collateral for a merchant whose keypair it generated itself. |
 | Anything else | [RUNBOOK.md](RUNBOOK.md#troubleshooting) has the full table. |
 
 ---
@@ -139,12 +144,13 @@ the payment account itself, which is how you show there is no key to steal.
 | | |
 |---|---|
 | Program ID | `HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4` (devnet) |
-| Escrowed per payment | 100% — the merchant is paid nothing up front |
-| Settlement fee | 0.50%, charged only when an order succeeds |
-| Refunds and reclaims | free |
-| Refund | needs both the buyer's and the merchant's signature |
-| Reclaim | buyer alone, after the expiry |
+| Instant eligibility | reserve covers the order **and** the buyer has settled at least one order before |
+| Settlement fee | 0.50% of the *escrowed* portion only, charged only on success |
+| Reclaims | free, always |
+| Reclaim | buyer alone, after the expiry — and it skims the merchant's own reserve to cover any instant portion too |
 | Escrow timeout range | 60 seconds to 30 days |
+| Claim dispute window | 24 hours |
+| Published max loss to a patient bust-out | `k²/(4c)` = 500 tokens, with today's constants (no leverage is actually extended yet, so this is a documented ceiling for a future version, not today's live exposure) |
 
 ---
 
@@ -155,9 +161,11 @@ follow-up will cost you more credibility than the claim ever bought. Say
 "hackathon-grade, and here's what a production version would need" — the
 Security Notes in [README.md](README.md#security-notes) list exactly that.
 
-**Don't say "this prevents fraud."** It makes fraud unprofitable. A merchant
-can still take an order and vanish — what they cannot do is keep the money.
-And say plainly what it does not solve: the chain cannot see whether goods
-arrived, so a buyer who takes delivery and refuses to confirm still costs the
-merchant the payment. Naming that before you are asked is worth more than any
-answer you give after.
+**Don't say "this prevents fraud."** It makes fraud unprofitable, bounded by
+whatever a merchant actually posted as collateral. A merchant can still take
+an order and vanish — what they cannot do is walk away with more than they
+put up. And say plainly what it does not solve: the chain cannot see whether
+goods arrived, so a dishonest buyer can still dispute a genuine
+`claim_fulfillment` and cost the merchant the payment. Naming that before you
+are asked — see README's "One asymmetry is deliberate, not a bug" — is worth
+more than any answer you give after.

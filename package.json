@@ -1,7 +1,7 @@
 {
   "name": "x402-scoring",
   "version": "0.1.0",
-  "description": "Agent CTOS anti-rug escrow program for x402 on Solana: on-chain PDA merchant tiering (1-4) with size-scaled, history-derived escrow reserves",
+  "description": "Agent CTOS x402 escrow for Solana: payments routed by posted merchant collateral and buyer standing, never by unverified reputation",
   "main": "target/types/x402_scoring.ts",
   "scripts": {
     "build": "anchor build",
@@ -9,7 +9,6 @@
     "deploy": "anchor deploy",
     "demo": "npx ts-node scripts/demo.ts",
     "pay": "npx ts-node scripts/pay.ts",
-    "carpool": "npx ts-node scripts/carpool.ts",
     "mcp": "npx ts-node scripts/mcp-server.ts"
   },
   "keywords": [

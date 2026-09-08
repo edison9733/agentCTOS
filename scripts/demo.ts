@@ -1,7 +1,7 @@
 /**
- * Agent CTOS x402 escrow — live demo.
+ * Agent CTOS x402 escrow — live demo of the collateral-routed model.
  *
- * Four acts, each stating a claim and proving it with a real transaction.
+ * Five acts, each stating a claim and proving it with a real transaction.
  * Every number printed is read back from the program's own on-chain accounts.
  *
  *   anchor build
@@ -49,8 +49,6 @@ function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
   return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
 }
 
-// Must match TREASURY in programs/x402-scoring/src/lib.rs. Compiled into the
-// program, so it cannot be redirected by a caller.
 const TREASURY = new PublicKey("5i7zzV9hQUCbpg8MXSNJB3QQkL6zscDd8VQKow46vg7E");
 
 const DECIMALS = 6;
@@ -60,7 +58,7 @@ const fmt = (n: BN | bigint | number) => {
   return (v / 10 ** DECIMALS).toFixed(3);
 };
 
-/** Act 2 starts this clock; act 4 waits it out. */
+/** Act 5 starts this clock; the same act waits it out. */
 const RUG_TIMEOUT_SECONDS = 60;
 
 function act(n: number, title: string) {
@@ -80,9 +78,6 @@ function explorer(kind: "tx" | "address", id: string, rpcUrl: string): string {
 }
 
 async function main() {
-  // "confirmed", not Anchor's default "processed": each setup step depends on
-  // the previous being visible, and a load-balanced RPC will otherwise answer
-  // from a node that has not caught up.
   const env = anchor.AnchorProvider.env();
   const connection = new anchor.web3.Connection(env.connection.rpcEndpoint, {
     commitment: "confirmed",
@@ -113,56 +108,37 @@ async function main() {
       program.programId
     )[0];
   const vaultPda = (payment: PublicKey) =>
-    PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), payment.toBuffer()],
-      program.programId
-    )[0];
+    PublicKey.findProgramAddressSync([Buffer.from("vault"), payment.toBuffer()], program.programId)[0];
+  const reservePda = (merchant: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("reserve"), merchant.toBuffer()], program.programId)[0];
+  const reserveVaultPda = (reserve: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("reserve_vault"), reserve.toBuffer()], program.programId)[0];
+  const standingPda = (b: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("standing"), b.toBuffer()], program.programId)[0];
 
   console.log("=".repeat(72));
-  console.log(" AGENT CTOS — x402 ESCROW");
-  console.log(" Every payment held until the buyer confirms, or the clock runs out.");
+  console.log(" AGENT CTOS — x402 ESCROW, ROUTED BY COLLATERAL");
+  console.log(" Extraction is bounded by posted collateral, not by knowing who anyone is.");
   console.log("=".repeat(72));
   console.log(` Network   ${rpcUrl}`);
   console.log(` Program   ${program.programId.toBase58()}`);
   console.log(` Buyer     ${buyer.publicKey.toBase58()}`);
 
-  const mint = await createMint(
-    provider.connection,
-    buyer,
-    provider.wallet.publicKey,
-    null,
-    DECIMALS
-  );
-  const buyerToken = await createAccount(
-    provider.connection,
-    buyer,
-    mint,
-    buyer.publicKey,
-    Keypair.generate()
-  );
-  await mintTo(
-    provider.connection,
-    buyer,
-    mint,
-    buyerToken,
-    provider.wallet.publicKey,
-    BigInt(unit(1_000).toString())
-  );
+  const mint = await createMint(provider.connection, buyer, provider.wallet.publicKey, null, DECIMALS);
+  const buyerToken = await createAccount(provider.connection, buyer, mint, buyer.publicKey, Keypair.generate());
+  await mintTo(provider.connection, buyer, mint, buyerToken, provider.wallet.publicKey, BigInt(unit(1_000).toString()));
   console.log(` Token     ${mint.toBase58()} (6 decimals, 1,000 minted to buyer)`);
 
-  // The settlement fee is a fixed percentage, paid to a compiled-in treasury.
-  const treasuryToken = await createAccount(
-    provider.connection, buyer, mint, TREASURY, Keypair.generate()
-  );
+  const treasuryToken = await createAccount(provider.connection, buyer, mint, TREASURY, Keypair.generate());
 
-  // Two merchants: one delivers, one takes the money and disappears.
   const honest = Keypair.generate();
   const rugger = Keypair.generate();
   const honestToken = await createAccount(provider.connection, buyer, mint, honest.publicKey, Keypair.generate());
   const ruggerToken = await createAccount(provider.connection, buyer, mint, rugger.publicKey, Keypair.generate());
 
-  const payFor = async (merchant: PublicKey, amount: BN, orderId: BN, timeout: number) => {
+  const payFor = async (merchant: PublicKey, merchantToken: PublicKey, amount: BN, orderId: BN, timeout: number) => {
     const payment = paymentPda(merchant, orderId);
+    const reserve = reservePda(merchant);
     const sig = await program.methods
       .initiatePayment(amount, orderId, new BN(timeout))
       .accounts({
@@ -170,7 +146,11 @@ async function main() {
         merchant,
         buyer: buyer.publicKey,
         buyerToken,
+        merchantToken,
         escrowVault: vaultPda(payment),
+        merchantReserve: reserve,
+        reserveVault: reserveVaultPda(reserve),
+        buyerStanding: standingPda(buyer.publicKey),
         mint,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
@@ -182,38 +162,65 @@ async function main() {
   };
 
   // -------------------------------------------------------------------
-  act(1, "The merchant is paid nothing up front");
-  claim("An x402 payment normally settles instantly and irreversibly. Here it does not.");
+  act(1, "A merchant posts collateral; the buyer sets up a history");
+  claim("Instant payment is never a matter of trust — it is capped by real, posted collateral.");
+
+  const reserve = reservePda(honest.publicKey);
+  const reserveVault = reserveVaultPda(reserve);
+  const openSig = await program.methods
+    .openReserve()
+    .accounts({
+      reserve,
+      merchant: honest.publicKey,
+      reserveVault,
+      mint,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .signers([honest])
+    .rpc();
+  record("open_reserve(honest)", openSig);
+
+  const merchantFunding = await createAccount(provider.connection, buyer, mint, honest.publicKey, Keypair.generate());
+  await mintTo(provider.connection, buyer, mint, merchantFunding, provider.wallet.publicKey, BigInt(unit(100).toString()));
+  const postSig = await program.methods
+    .postReserve(unit(100))
+    .accounts({
+      reserve,
+      merchant: honest.publicKey,
+      reserveVault,
+      merchantToken: merchantFunding,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .signers([honest])
+    .rpc();
+  record("post_reserve(honest, 100)", postSig);
+
+  const registerSig = await program.methods
+    .registerBuyer()
+    .accounts({ standing: standingPda(buyer.publicKey), buyer: buyer.publicKey, systemProgram: SystemProgram.programId })
+    .signers([buyer])
+    .rpc();
+  record("register_buyer", registerSig);
+  proof(`merchant reserve holds ${fmt((await getAccount(provider.connection, reserveVault)).amount)} tokens`);
+  note("The buyer has just registered, with zero orders settled — standing is not the same as intent.");
+
+  // -------------------------------------------------------------------
+  act(2, "This buyer's first order is still fully escrowed");
+  claim("A brand-new buyer defaults to protection, even against a fully-collateralized merchant.");
 
   const orderA = new BN(Date.now() % 100_000);
-  const a = await payFor(honest.publicKey, unit(30), orderA, 3600);
-  record("initiate_payment(honest)", a.sig);
+  const a = await payFor(honest.publicKey, honestToken, unit(30), orderA, 3600);
+  record("initiate_payment(honest, first order)", a.sig);
 
   const pa: any = await program.account.payment.fetch(a.payment);
   proof(
-    `30.000 paid → vault holds ${fmt((await getAccount(provider.connection, a.vault)).amount)}, ` +
-      `merchant received ${fmt((await getAccount(provider.connection, honestToken)).amount)}`
+    `instant ${fmt(pa.instantAmount)}, escrowed ${fmt(pa.escrowedAmount)} — ` +
+      `full escrow despite ${fmt(unit(100))} in reserve, because standing is still zero`
   );
-  note(`Status is ${Object.keys(pa.status)[0]}. The money left the buyer but has not reached the merchant.`);
-  note("The vault is owned by the payment account itself — no keypair anywhere can move it.");
 
-  // -------------------------------------------------------------------
-  act(2, "A second merchant takes an order and vanishes");
-  claim("The rug starts here. This merchant will do nothing at all.");
-
-  const orderB = orderA.add(new BN(1));
-  const b = await payFor(rugger.publicKey, unit(40), orderB, RUG_TIMEOUT_SECONDS);
-  record("initiate_payment(rugger)", b.sig);
-
-  const pb: any = await program.account.payment.fetch(b.payment);
-  proof(`40.000 escrowed; reclaimable after ${new Date(pb.expiry.toNumber() * 1000).toISOString()}`);
-  note(`The buyer chose that ${RUG_TIMEOUT_SECONDS}s deadline when paying. The merchant cannot change it.`);
-
-  // -------------------------------------------------------------------
-  act(3, "Delivery releases the money — and only the buyer can say so");
-  claim("The honest merchant delivers, the buyer confirms, and the escrow is released.");
-
-  const sigConfirm = await program.methods
+  const sigConfirmA = await program.methods
     .confirmDelivery(orderA)
     .accounts({
       payment: a.payment,
@@ -221,38 +228,85 @@ async function main() {
       escrowVault: a.vault,
       merchantToken: honestToken,
       treasuryToken,
+      merchantReserve: reserve,
+      buyerStanding: standingPda(buyer.publicKey),
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .signers([buyer])
     .rpc();
-  record("confirm_delivery(honest)", sigConfirm);
+  record("confirm_delivery(honest, first order)", sigConfirmA);
+  const standingNow: any = await program.account.buyerStanding.fetch(standingPda(buyer.publicKey));
+  note(`Delivery confirmed. settled_count is now ${standingNow.settledCount} — the buyer just earned standing.`);
 
-  const pa2: any = await program.account.payment.fetch(a.payment);
+  // -------------------------------------------------------------------
+  act(3, "The same buyer's next order pays the merchant instantly");
+  claim("Established standing plus real collateral is what the router actually rewards.");
+
+  const orderA2 = orderA.add(new BN(1));
+  const a2 = await payFor(honest.publicKey, honestToken, unit(60), orderA2, 3600);
+  record("initiate_payment(honest, second order)", a2.sig);
+
+  const pa2: any = await program.account.payment.fetch(a2.payment);
   proof(
-    `merchant now holds ${fmt((await getAccount(provider.connection, honestToken)).amount)}; ` +
-      `status ${Object.keys(pa2.status)[0]}`
+    `instant ${fmt(pa2.instantAmount)}, escrowed ${fmt(pa2.escrowedAmount)} — ` +
+      `paid in full, immediately, no fee on the instant portion`
   );
-  note(
-    `A ${fmt(pa2.feeAmount)} settlement fee (0.50%) went to the protocol — charged only because this ` +
-      `order succeeded.`
-  );
-  note("A refund at this point would need the merchant's own signature — the buyer cannot claw it back.");
+  note(`Merchant balance is now ${fmt((await getAccount(provider.connection, honestToken)).amount)}, before any confirmation at all.`);
 
-  const sigClose = await program.methods
+  const sigCloseA = await program.methods
     .closePayment(orderA)
     .accounts({ payment: a.payment, buyer: buyer.publicKey })
     .signers([buyer])
     .rpc();
-  record("close_payment(honest)", sigClose);
-  note("Order record closed and its rent refunded. The history survives as an on-chain event,");
-  note("which matters: x402 is built for micropayments, and permanent accounts cost more than the payment.");
+  record("close_payment(honest, first order)", sigCloseA);
 
   // -------------------------------------------------------------------
-  act(4, "Surviving the rug, with no merchant signature");
-  claim("When the merchant never delivers, the buyer takes the money back alone.");
+  act(4, "A second merchant posts collateral, takes an instant order, and vanishes");
+  claim("The rug starts here — and this time there is something to lose besides the escrow.");
 
-  const pb1: any = await program.account.payment.fetch(b.payment);
-  const waitMs = Math.max(0, pb1.expiry.toNumber() * 1000 - Date.now()) + 2_000;
+  const ruggerReserve = reservePda(rugger.publicKey);
+  const ruggerReserveVault = reserveVaultPda(ruggerReserve);
+  await program.methods
+    .openReserve()
+    .accounts({
+      reserve: ruggerReserve,
+      merchant: rugger.publicKey,
+      reserveVault: ruggerReserveVault,
+      mint,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .signers([rugger])
+    .rpc();
+  const ruggerFunding = await createAccount(provider.connection, buyer, mint, rugger.publicKey, Keypair.generate());
+  await mintTo(provider.connection, buyer, mint, ruggerFunding, provider.wallet.publicKey, BigInt(unit(40).toString()));
+  await program.methods
+    .postReserve(unit(40))
+    .accounts({
+      reserve: ruggerReserve,
+      merchant: rugger.publicKey,
+      reserveVault: ruggerReserveVault,
+      merchantToken: ruggerFunding,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .signers([rugger])
+    .rpc();
+
+  const orderB = orderA2.add(new BN(1));
+  const b = await payFor(rugger.publicKey, ruggerToken, unit(40), orderB, RUG_TIMEOUT_SECONDS);
+  record("initiate_payment(rugger)", b.sig);
+  const pb: any = await program.account.payment.fetch(b.payment);
+  proof(
+    `instant ${fmt(pb.instantAmount)} paid to the rugger already, backed by its own ${fmt(unit(40))}-token reserve`
+  );
+  note(`Reclaimable after ${new Date(pb.expiry.toNumber() * 1000).toISOString()}. The merchant did not deliver, and never will.`);
+
+  // -------------------------------------------------------------------
+  act(5, "Surviving the rug: the reserve gets skimmed, the buyer is made whole");
+  claim("Timeout does not just return the escrow — it recovers the instant portion from collateral too.");
+
+  const waitMs = Math.max(0, pb.expiry.toNumber() * 1000 - Date.now()) + 2_000;
   if (waitMs > 0) {
     note(`escrow not yet expired — waiting ${Math.ceil(waitMs / 1000)}s`);
     await new Promise((r) => setTimeout(r, waitMs));
@@ -266,31 +320,30 @@ async function main() {
       buyer: buyer.publicKey,
       escrowVault: b.vault,
       buyerToken,
+      merchantReserve: ruggerReserve,
+      reserveVault: ruggerReserveVault,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .signers([buyer])
     .rpc();
   record("reclaim_timeout(rugger)", sigReclaim);
 
-  const pb2: any = await program.account.payment.fetch(b.payment);
   const afterBuyer = (await getAccount(provider.connection, buyerToken)).amount;
+  const ruggerReserveAfter: any = await program.account.merchantReserve.fetch(ruggerReserve);
   proof(
-    `buyer recovered ${fmt(Number(afterBuyer - beforeBuyer))}; ` +
-      `rugger ended with ${fmt((await getAccount(provider.connection, ruggerToken)).amount)}`
+    `buyer recovered ${fmt(Number(afterBuyer - beforeBuyer))} in total — the full order, ` +
+      `instant portion included, straight out of the rugger's own reserve`
   );
-  note(`Status ${Object.keys(pb2.status)[0]}. Signed by the buyer alone — the merchant was not asked,`);
-  note("and had no way to object. That is the whole guarantee.");
+  note(`Rugger's reserve balance: ${fmt((await getAccount(provider.connection, ruggerReserveVault)).amount)}; locked exposure: ${fmt(ruggerReserveAfter.lockedExposure)}.`);
+  note("No merchant signature anywhere in that transaction. Fake reputation could not have prevented this,");
+  note("and did not need to be detected — the loss was already bounded by what the rugger itself posted.");
 
   // -------------------------------------------------------------------
   console.log("\n" + "=".repeat(72));
   console.log(" VERIFY INDEPENDENTLY");
   console.log("=".repeat(72));
   console.log(links.join("\n"));
-  console.log(`\n   Open order (rugged)  ${explorer("address", b.payment.toBase58(), rpcUrl)}`);
-  console.log(
-    `\n   Buyer balance: 1000.000 → ${fmt((await getAccount(provider.connection, buyerToken)).amount)}` +
-      `   (30.000 spent on the delivered order, 40.000 recovered from the rug)`
-  );
+  console.log(`\n   Buyer final balance   ${fmt((await getAccount(provider.connection, buyerToken)).amount)}`);
   console.log("   Every figure above was read back from on-chain state.\n");
 }
 

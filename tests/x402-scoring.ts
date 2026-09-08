@@ -19,13 +19,10 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
-describe("x402 escrow", () => {
+describe("x402 escrow — routed by collateral", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  // anchor.workspace mis-derives the IDL filename for program names containing
-  // digits (x_402_scoring.json), and anchor-cli 0.29 emits no address field in
-  // the IDL, so both are read from disk instead.
   const idl = JSON.parse(
     fs.readFileSync(path.join(__dirname, "..", "target", "idl", "x402_scoring.json"), "utf8")
   );
@@ -41,7 +38,6 @@ describe("x402 escrow", () => {
   ).publicKey;
   const program = new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
 
-  // Must match TREASURY in programs/x402-scoring/src/lib.rs.
   const TREASURY = new PublicKey("5i7zzV9hQUCbpg8MXSNJB3QQkL6zscDd8VQKow46vg7E");
   const FEE_BPS = 50;
 
@@ -49,7 +45,6 @@ describe("x402 escrow", () => {
   const unit = (n: number) => new BN(Math.round(n * 10 ** DECIMALS));
   const payerWallet = (provider.wallet as anchor.Wallet).payer;
 
-  const buyer = Keypair.generate();
   let mint: PublicKey;
   let treasuryToken: PublicKey;
 
@@ -65,104 +60,96 @@ describe("x402 escrow", () => {
     )[0];
 
   const vaultPda = (payment: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("vault"), payment.toBuffer()], program.programId)[0];
+
+  const reservePda = (merchant: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("reserve"), merchant.toBuffer()], program.programId)[0];
+
+  const reserveVaultPda = (reserve: PublicKey) =>
     PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), payment.toBuffer()],
+      [Buffer.from("reserve_vault"), reserve.toBuffer()],
       program.programId
     )[0];
 
-  const pooledPaymentPda = (coordinator: PublicKey, merchant: PublicKey, orderId: BN) =>
-    PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("pooled_payment"),
-        coordinator.toBuffer(),
-        merchant.toBuffer(),
-        orderId.toArrayLike(Buffer, "le", 8),
-      ],
-      program.programId
-    )[0];
+  const standingPda = (buyer: PublicKey) =>
+    PublicKey.findProgramAddressSync([Buffer.from("standing"), buyer.toBuffer()], program.programId)[0];
 
-  const pooledVaultPda = (payment: PublicKey) =>
-    PublicKey.findProgramAddressSync(
-      [Buffer.from("pooled_vault"), payment.toBuffer()],
-      program.programId
-    )[0];
+  before(async () => {
+    mint = await createMint(provider.connection, payerWallet, provider.wallet.publicKey, null, DECIMALS);
+    treasuryToken = await createAccount(provider.connection, payerWallet, mint, TREASURY, Keypair.generate());
+  });
 
-  /** A funded contributor: a fresh keypair with SOL for rent, and a token
-   *  account holding exactly `amount`. */
-  async function fundedContributor(amount: BN): Promise<{ keypair: Keypair; token: PublicKey }> {
+  /** A fresh, funded buyer keypair with its own token account. */
+  async function fundedBuyer(amount: BN): Promise<{ keypair: Keypair; token: PublicKey }> {
     const keypair = Keypair.generate();
-    const sig = await provider.connection.requestAirdrop(keypair.publicKey, LAMPORTS_PER_SOL / 10);
+    const sig = await provider.connection.requestAirdrop(keypair.publicKey, LAMPORTS_PER_SOL / 5);
     await provider.connection.confirmTransaction(sig);
-    const token = await createAccount(
-      provider.connection,
-      payerWallet,
-      mint,
-      keypair.publicKey,
-      Keypair.generate()
-    );
+    const token = await createAccount(provider.connection, payerWallet, mint, keypair.publicKey, Keypair.generate());
     await mintTo(provider.connection, payerWallet, mint, token, provider.wallet.publicKey, BigInt(amount.toString()));
     return { keypair, token };
   }
 
-  before(async () => {
-    const sig = await provider.connection.requestAirdrop(buyer.publicKey, 2 * LAMPORTS_PER_SOL);
-    await provider.connection.confirmTransaction(sig);
-    mint = await createMint(
-      provider.connection,
-      payerWallet,
-      provider.wallet.publicKey,
-      null,
-      DECIMALS
-    );
-    // The treasury is a fixed address in the program, so this account is
-    // created for it rather than by it — the test wallet only pays the rent.
-    treasuryToken = await createAccount(
-      provider.connection,
-      payerWallet,
-      mint,
-      TREASURY,
-      Keypair.generate()
-    );
-  });
-
-  /** A funded buyer token account. Each call gets its own, so tests never
-   *  collide on the single associated token account for (mint, buyer). */
-  async function fundedBuyerToken(amount: BN): Promise<PublicKey> {
-    const acct = await createAccount(
-      provider.connection,
-      payerWallet,
-      mint,
-      buyer.publicKey,
-      Keypair.generate()
-    );
-    await mintTo(
-      provider.connection,
-      payerWallet,
-      mint,
-      acct,
-      provider.wallet.publicKey,
-      BigInt(amount.toString())
-    );
-    return acct;
-  }
-
-  async function newMerchant() {
+  /** A fresh merchant, optionally with a reserve opened and funded. */
+  async function newMerchant(reserveAmount?: BN) {
     const owner = Keypair.generate();
-    const sig = await provider.connection.requestAirdrop(owner.publicKey, LAMPORTS_PER_SOL / 20);
+    const sig = await provider.connection.requestAirdrop(owner.publicKey, LAMPORTS_PER_SOL / 5);
     await provider.connection.confirmTransaction(sig);
-    const token = await createAccount(
-      provider.connection,
-      payerWallet,
-      mint,
-      owner.publicKey,
-      Keypair.generate()
-    );
+    const token = await createAccount(provider.connection, payerWallet, mint, owner.publicKey, Keypair.generate());
+
+    if (reserveAmount !== undefined) {
+      const reserve = reservePda(owner.publicKey);
+      const reserveVault = reserveVaultPda(reserve);
+      await program.methods
+        .openReserve()
+        .accounts({
+          reserve,
+          merchant: owner.publicKey,
+          reserveVault,
+          mint,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY,
+        })
+        .signers([owner])
+        .rpc();
+
+      if (reserveAmount.gtn(0)) {
+        const funding = await createAccount(provider.connection, payerWallet, mint, owner.publicKey, Keypair.generate());
+        await mintTo(provider.connection, payerWallet, mint, funding, provider.wallet.publicKey, BigInt(reserveAmount.toString()));
+        await program.methods
+          .postReserve(reserveAmount)
+          .accounts({
+            reserve,
+            merchant: owner.publicKey,
+            reserveVault,
+            merchantToken: funding,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .signers([owner])
+          .rpc();
+      }
+    }
     return { owner, token };
   }
 
+  async function registerBuyer(buyer: Keypair) {
+    await program.methods
+      .registerBuyer()
+      .accounts({
+        standing: standingPda(buyer.publicKey),
+        buyer: buyer.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([buyer])
+      .rpc();
+  }
+
+  /** Pays for one order, routed through whatever reserve/standing already exist. */
   async function pay(
-    merchant: PublicKey,
+    buyer: Keypair,
     buyerToken: PublicKey,
+    merchant: PublicKey,
+    merchantToken: PublicKey,
     amount: BN,
     orderId: BN,
     timeoutSeconds = 3600
@@ -175,7 +162,11 @@ describe("x402 escrow", () => {
         merchant,
         buyer: buyer.publicKey,
         buyerToken,
+        merchantToken,
         escrowVault: vaultPda(payment),
+        merchantReserve: reservePda(merchant),
+        reserveVault: reserveVaultPda(reservePda(merchant)),
+        buyerStanding: standingPda(buyer.publicKey),
         mint,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
@@ -186,154 +177,336 @@ describe("x402 escrow", () => {
     return { payment, vault: vaultPda(payment) };
   }
 
-  it("escrows the whole payment — the merchant receives nothing up front", async () => {
+  it("no reserve, no standing: the whole order is escrowed, nothing paid up front", async () => {
     const { owner, token } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
 
-    const { payment, vault } = await pay(owner.publicKey, buyerToken, unit(25), new BN(1));
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(25), new BN(1));
 
-    const p = await program.account.payment.fetch(payment);
+    const p: any = await program.account.payment.fetch(payment);
     assert.equal(p.amount.toString(), unit(25).toString());
+    assert.equal(p.instantAmount.toNumber(), 0);
+    assert.equal(p.escrowedAmount.toString(), unit(25).toString());
     assert.deepEqual(p.status, { escrowHeld: {} });
-    assert.equal(p.merchant.toBase58(), owner.publicKey.toBase58());
-    assert.equal(p.mint.toBase58(), mint.toBase58());
-
     assert.equal((await getAccount(provider.connection, vault)).amount.toString(), unit(25).toString());
     assert.equal((await getAccount(provider.connection, token)).amount.toString(), "0");
-    assert.equal(
-      (await getAccount(provider.connection, buyerToken)).amount.toString(),
-      unit(75).toString()
-    );
   });
 
-  it("confirm_delivery releases the escrow to the merchant", async () => {
+  it("full reserve + established buyer: the whole order pays instantly", async () => {
+    const { owner, token } = await newMerchant(unit(100));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(200));
+    await registerBuyer(buyer);
+
+    // Establish standing with a first, unrelated (no-reserve) order.
+    const first = await newMerchant();
+    await pay(buyer, buyerToken, first.owner.publicKey, first.token, unit(10), new BN(100));
+    await program.methods
+      .confirmDelivery(new BN(100))
+      .accounts({
+        payment: paymentPda(buyer.publicKey, first.owner.publicKey, new BN(100)),
+        buyer: buyer.publicKey,
+        escrowVault: vaultPda(paymentPda(buyer.publicKey, first.owner.publicKey, new BN(100))),
+        merchantToken: first.token,
+        treasuryToken,
+        merchantReserve: reservePda(first.owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+    const standingAfterFirst: any = await program.account.buyerStanding.fetch(standingPda(buyer.publicKey));
+    assert.equal(standingAfterFirst.settledCount, 1, "buyer is now established");
+
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(60), new BN(101));
+
+    const p: any = await program.account.payment.fetch(payment);
+    assert.equal(p.instantAmount.toString(), unit(60).toString());
+    assert.equal(p.escrowedAmount.toNumber(), 0, "fully covered by reserve: nothing escrowed");
+    assert.equal(
+      (await getAccount(provider.connection, token)).amount.toString(),
+      unit(60).toString(),
+      "the merchant was paid instantly, in full, no fee on the instant portion"
+    );
+    const reserve: any = await program.account.merchantReserve.fetch(reservePda(owner.publicKey));
+    assert.equal(reserve.lockedExposure.toString(), unit(60).toString());
+    // A fully-instant order still opens a (now-empty) vault, closed on settlement.
+    assert.equal((await getAccount(provider.connection, vault)).amount.toString(), "0");
+  });
+
+  it("full reserve + no history: still full escrow — a new buyer defaults to protection", async () => {
+    const { owner, token } = await newMerchant(unit(100));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(50));
+    // Deliberately not registered: no BuyerStanding account exists at all.
+
+    const { payment } = await pay(buyer, buyerToken, owner.publicKey, token, unit(30), new BN(2));
+    const p: any = await program.account.payment.fetch(payment);
+    assert.equal(p.instantAmount.toNumber(), 0);
+    assert.equal(p.escrowedAmount.toString(), unit(30).toString());
+  });
+
+  it("partial reserve + established buyer: splits, instant up to the reserve", async () => {
+    const { owner, token } = await newMerchant(unit(20));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(200));
+    await registerBuyer(buyer);
+    const first = await newMerchant();
+    await pay(buyer, buyerToken, first.owner.publicKey, first.token, unit(5), new BN(110));
+    await program.methods
+      .confirmDelivery(new BN(110))
+      .accounts({
+        payment: paymentPda(buyer.publicKey, first.owner.publicKey, new BN(110)),
+        buyer: buyer.publicKey,
+        escrowVault: vaultPda(paymentPda(buyer.publicKey, first.owner.publicKey, new BN(110))),
+        merchantToken: first.token,
+        treasuryToken,
+        merchantReserve: reservePda(first.owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(50), new BN(111));
+    const p: any = await program.account.payment.fetch(payment);
+    assert.equal(p.instantAmount.toString(), unit(20).toString(), "instant portion capped at the reserve");
+    assert.equal(p.escrowedAmount.toString(), unit(30).toString(), "the rest is escrowed");
+    assert.equal((await getAccount(provider.connection, token)).amount.toString(), unit(20).toString());
+    assert.equal((await getAccount(provider.connection, vault)).amount.toString(), unit(30).toString());
+  });
+
+  it("no reserve + established buyer: still full escrow — nothing to lend against", async () => {
+    const { owner, token } = await newMerchant(); // no reserve opened at all
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
+    await registerBuyer(buyer);
+    const first = await newMerchant();
+    await pay(buyer, buyerToken, first.owner.publicKey, first.token, unit(5), new BN(120));
+    await program.methods
+      .confirmDelivery(new BN(120))
+      .accounts({
+        payment: paymentPda(buyer.publicKey, first.owner.publicKey, new BN(120)),
+        buyer: buyer.publicKey,
+        escrowVault: vaultPda(paymentPda(buyer.publicKey, first.owner.publicKey, new BN(120))),
+        merchantToken: first.token,
+        treasuryToken,
+        merchantReserve: reservePda(first.owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+
+    const { payment } = await pay(buyer, buyerToken, owner.publicKey, token, unit(15), new BN(121));
+    const p: any = await program.account.payment.fetch(payment);
+    assert.equal(p.instantAmount.toNumber(), 0);
+    assert.equal(p.escrowedAmount.toString(), unit(15).toString());
+  });
+
+  it("confirm_delivery charges the fee only on the escrowed portion", async () => {
     const { owner, token } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(2);
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(25), orderId);
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
+    const orderId = new BN(3);
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(25), orderId);
 
     await program.methods
       .confirmDelivery(orderId)
       .accounts({
         payment,
         buyer: buyer.publicKey,
-        escrowVault: vaultPda(payment),
+        escrowVault: vault,
         merchantToken: token,
         treasuryToken,
+        merchantReserve: reservePda(owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([buyer])
       .rpc();
 
     const fee = unit(25).muln(FEE_BPS).divn(10_000);
-    const p = await program.account.payment.fetch(payment);
+    const p: any = await program.account.payment.fetch(payment);
     assert.deepEqual(p.status, { settled: {} });
     assert.equal(p.feeAmount.toString(), fee.toString());
     assert.equal(
       (await getAccount(provider.connection, token)).amount.toString(),
-      unit(25).sub(fee).toString(),
-      "the merchant receives the order minus the settlement fee"
-    );
-    assert.equal(
-      (await getAccount(provider.connection, treasuryToken)).amount.toString(),
-      fee.toString()
+      unit(25).sub(fee).toString()
     );
   });
 
-  it("refund_escrow returns the money in full when both parties sign", async () => {
-    const { owner } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(3);
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(25), orderId);
-
+  it("withdraw_reserve is rejected past the currently-available (unlocked) balance", async () => {
+    const { owner } = await newMerchant(unit(50));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(200));
+    await registerBuyer(buyer);
+    const first = await newMerchant();
+    await pay(buyer, buyerToken, first.owner.publicKey, first.token, unit(5), new BN(130));
     await program.methods
-      .refundEscrow(orderId)
+      .confirmDelivery(new BN(130))
       .accounts({
-        payment,
-        merchant: owner.publicKey,
+        payment: paymentPda(buyer.publicKey, first.owner.publicKey, new BN(130)),
         buyer: buyer.publicKey,
-        escrowVault: vaultPda(payment),
-        buyerToken,
+        escrowVault: vaultPda(paymentPda(buyer.publicKey, first.owner.publicKey, new BN(130))),
+        merchantToken: first.token,
+        treasuryToken,
+        merchantReserve: reservePda(first.owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([owner, buyer])
+      .signers([buyer])
       .rpc();
 
-    const p = await program.account.payment.fetch(payment);
-    assert.deepEqual(p.status, { refunded: {} });
-    assert.equal(p.feeAmount.toNumber(), 0, "a refund must not charge a fee");
-    assert.equal(
-      (await getAccount(provider.connection, buyerToken)).amount.toString(),
-      unit(100).toString()
-    );
+    // Lock 40 of the merchant's 50 reserve into an outstanding instant order.
+    await pay(buyer, buyerToken, owner.publicKey, (await newMerchant()).token, unit(40), new BN(131));
+
+    const withdrawDest = await createAccount(provider.connection, payerWallet, mint, owner.publicKey, Keypair.generate());
+    try {
+      await program.methods
+        .withdrawReserve(unit(20)) // only 10 is actually unlocked
+        .accounts({
+          reserve: reservePda(owner.publicKey),
+          merchant: owner.publicKey,
+          reserveVault: reserveVaultPda(reservePda(owner.publicKey)),
+          merchantToken: withdrawDest,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([owner])
+        .rpc();
+      assert.fail("expected the over-limit withdrawal to be rejected");
+    } catch (err) {
+      assert.ok(String(err).includes("InsufficientReserve"), `expected InsufficientReserve, got: ${err}`);
+    }
+
+    await program.methods
+      .withdrawReserve(unit(10))
+      .accounts({
+        reserve: reservePda(owner.publicKey),
+        merchant: owner.publicKey,
+        reserveVault: reserveVaultPda(reservePda(owner.publicKey)),
+        merchantToken: withdrawDest,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([owner])
+      .rpc();
+    assert.equal((await getAccount(provider.connection, withdrawDest)).amount.toString(), unit(10).toString());
   });
 
-  it("neither party can refund alone — a cancellation needs both", async () => {
-    // A buyer alone could otherwise take delivery and pull the money back; a
-    // merchant alone could cancel an order already paid for. Acting alone has
-    // exactly one route, and it waits for the clock: reclaim_timeout.
-    const { owner } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(4);
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(25), orderId);
+  it("reclaim_timeout returns the escrow and skims the reserve to make the buyer whole", async () => {
+    const { owner, token } = await newMerchant(unit(100));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(200));
+    await registerBuyer(buyer);
+    const first = await newMerchant();
+    await pay(buyer, buyerToken, first.owner.publicKey, first.token, unit(5), new BN(140));
+    await program.methods
+      .confirmDelivery(new BN(140))
+      .accounts({
+        payment: paymentPda(buyer.publicKey, first.owner.publicKey, new BN(140)),
+        buyer: buyer.publicKey,
+        escrowVault: vaultPda(paymentPda(buyer.publicKey, first.owner.publicKey, new BN(140))),
+        merchantToken: first.token,
+        treasuryToken,
+        merchantReserve: reservePda(first.owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+
+    const orderId = new BN(141);
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(60), orderId, 61);
+    const balanceAfterPay = (await getAccount(provider.connection, buyerToken)).amount;
+
+    await new Promise((r) => setTimeout(r, 62_000));
+
+    await program.methods
+      .reclaimTimeout(orderId)
+      .accounts({
+        payment,
+        buyer: buyer.publicKey,
+        escrowVault: vault,
+        buyerToken,
+        merchantReserve: reservePda(owner.publicKey),
+        reserveVault: reserveVaultPda(reservePda(owner.publicKey)),
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([buyer])
+      .rpc();
+
+    const p: any = await program.account.payment.fetch(payment);
+    assert.deepEqual(p.status, { reclaimed: {} });
+    assert.equal(p.feeAmount.toNumber(), 0);
+    const balanceAfterReclaim = (await getAccount(provider.connection, buyerToken)).amount;
+    assert.equal(
+      (balanceAfterReclaim - balanceAfterPay).toString(),
+      unit(60).toString(),
+      "buyer recovers the full order: the escrowed remainder plus the skimmed instant amount"
+    );
+    const reserve: any = await program.account.merchantReserve.fetch(reservePda(owner.publicKey));
+    assert.equal(reserve.lockedExposure.toNumber(), 0, "exposure is released even though the reserve was skimmed");
+  }).timeout(150_000);
+
+  it("claim_fulfillment -> finalize_claim pays an honest merchant when the buyer never returns", async () => {
+    const { owner, token } = await newMerchant();
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
+    const orderId = new BN(150);
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(25), orderId, 3600);
+
+    await program.methods
+      .claimFulfillment(orderId)
+      .accounts({ payment, merchant: owner.publicKey })
+      .signers([owner])
+      .rpc();
+
+    let p: any = await program.account.payment.fetch(payment);
+    assert.ok(p.claimedAt.toNumber() > 0);
 
     try {
       await program.methods
-        .refundEscrow(orderId)
+        .finalizeClaim(orderId)
         .accounts({
           payment,
+          escrowVault: vault,
           merchant: owner.publicKey,
-          buyer: buyer.publicKey,
-          escrowVault: vaultPda(payment),
-          buyerToken,
+          merchantToken: token,
+          treasuryToken,
+          merchantReserve: reservePda(owner.publicKey),
+          buyerStanding: standingPda(buyer.publicKey),
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([buyer]) // buyer signs; the merchant does not
         .rpc();
-      assert.fail("expected the refund to be rejected without the merchant's signature");
+      assert.fail("expected finalize_claim to be rejected before the dispute window elapses");
     } catch (err) {
-      assert.ok(
-        /Signature verification failed|missing required signature|unknown signer/i.test(String(err)),
-        `expected a missing-signature failure, got: ${err}`
-      );
+      assert.ok(String(err).includes("ClaimNotYetFinalizable"), `expected ClaimNotYetFinalizable, got: ${err}`);
     }
 
-    const p = await program.account.payment.fetch(payment);
+    p = await program.account.payment.fetch(payment);
+    assert.deepEqual(p.status, { escrowHeld: {} }, "still open — the dispute window has not elapsed in this test");
+  });
+
+  it("dispute_claim clears a claim and falls back to the normal timeout path", async () => {
+    const { owner, token } = await newMerchant();
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
+    const orderId = new BN(151);
+    const { payment } = await pay(buyer, buyerToken, owner.publicKey, token, unit(25), orderId, 3600);
+
+    await program.methods
+      .claimFulfillment(orderId)
+      .accounts({ payment, merchant: owner.publicKey })
+      .signers([owner])
+      .rpc();
+
+    await program.methods
+      .disputeClaim(orderId)
+      .accounts({ payment, buyer: buyer.publicKey })
+      .signers([buyer])
+      .rpc();
+
+    const p: any = await program.account.payment.fetch(payment);
+    assert.equal(p.claimedAt.toNumber(), 0, "the claim is cleared");
     assert.deepEqual(p.status, { escrowHeld: {} });
   });
 
-  it("reclaim is rejected before the escrow expires", async () => {
-    const { owner } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(5);
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(25), orderId);
-
-    try {
-      await program.methods
-        .reclaimTimeout(orderId)
-        .accounts({
-          payment,
-          buyer: buyer.publicKey,
-          escrowVault: vaultPda(payment),
-          buyerToken,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([buyer])
-        .rpc();
-      assert.fail("expected reclaim before expiry to be rejected");
-    } catch (err) {
-      assert.ok(
-        String(err).includes("ReclaimNotYetAvailable"),
-        `expected ReclaimNotYetAvailable, got: ${err}`
-      );
-    }
-  });
-
   it("rejects a timeout outside the allowed range", async () => {
-    const { owner } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
+    const { owner, token } = await newMerchant();
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
     try {
-      await pay(owner.publicKey, buyerToken, unit(10), new BN(6), 30);
+      await pay(buyer, buyerToken, owner.publicKey, token, unit(10), new BN(6), 30);
       assert.fail("expected a sub-minimum timeout to be rejected");
     } catch (err) {
       assert.ok(String(err).includes("InvalidTimeout"), `expected InvalidTimeout, got: ${err}`);
@@ -341,13 +514,13 @@ describe("x402 escrow", () => {
   });
 
   it("rejects a replayed order id", async () => {
-    const { owner } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
+    const { owner, token } = await newMerchant();
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
     const orderId = new BN(7);
-    await pay(owner.publicKey, buyerToken, unit(10), orderId);
+    await pay(buyer, buyerToken, owner.publicKey, token, unit(10), orderId);
 
     try {
-      await pay(owner.publicKey, buyerToken, unit(10), orderId);
+      await pay(buyer, buyerToken, owner.publicKey, token, unit(10), orderId);
       assert.fail("expected the duplicate order id to be rejected");
     } catch (err) {
       assert.ok(
@@ -359,9 +532,9 @@ describe("x402 escrow", () => {
 
   it("close_payment refunds rent once an order is finished, but not before", async () => {
     const { owner, token } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
+    const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(100));
     const orderId = new BN(8);
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(25), orderId);
+    const { payment, vault } = await pay(buyer, buyerToken, owner.publicKey, token, unit(25), orderId);
 
     try {
       await program.methods
@@ -371,10 +544,7 @@ describe("x402 escrow", () => {
         .rpc();
       assert.fail("expected closing an open escrow to be rejected");
     } catch (err) {
-      assert.ok(
-        String(err).includes("PaymentStillOpen"),
-        `expected PaymentStillOpen, got: ${err}`
-      );
+      assert.ok(String(err).includes("PaymentStillOpen"), `expected PaymentStillOpen, got: ${err}`);
     }
 
     await program.methods
@@ -382,9 +552,11 @@ describe("x402 escrow", () => {
       .accounts({
         payment,
         buyer: buyer.publicKey,
-        escrowVault: vaultPda(payment),
+        escrowVault: vault,
         merchantToken: token,
         treasuryToken,
+        merchantReserve: reservePda(owner.publicKey),
+        buyerStanding: standingPda(buyer.publicKey),
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([buyer])
@@ -401,280 +573,14 @@ describe("x402 escrow", () => {
       (await provider.connection.getBalance(buyer.publicKey)) > before,
       "closing the payment should have returned its rent to the buyer"
     );
-    assert.equal(
-      await provider.connection.getAccountInfo(payment),
-      null,
-      "the payment account should no longer exist"
-    );
+    assert.equal(await provider.connection.getAccountInfo(payment), null);
   });
 
-  it("batch_confirm_delivery settles multiple orders in one transaction", async () => {
-    const { owner: owner1, token: token1 } = await newMerchant();
-    const { owner: owner2, token: token2 } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(200));
-
-    const orderId1 = new BN(10);
-    const orderId2 = new BN(11);
-    const { payment: payment1, vault: vault1 } = await pay(
-      owner1.publicKey,
-      buyerToken,
-      unit(30),
-      orderId1
-    );
-    const { payment: payment2, vault: vault2 } = await pay(
-      owner2.publicKey,
-      buyerToken,
-      unit(50),
-      orderId2
-    );
-
-    const treasuryBefore = (await getAccount(provider.connection, treasuryToken)).amount;
-
-    await program.methods
-      .batchConfirmDelivery()
-      .accounts({
-        buyer: buyer.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .remainingAccounts([
-        { pubkey: payment1, isWritable: true, isSigner: false },
-        { pubkey: vault1, isWritable: true, isSigner: false },
-        { pubkey: token1, isWritable: true, isSigner: false },
-        { pubkey: treasuryToken, isWritable: true, isSigner: false },
-        { pubkey: payment2, isWritable: true, isSigner: false },
-        { pubkey: vault2, isWritable: true, isSigner: false },
-        { pubkey: token2, isWritable: true, isSigner: false },
-        { pubkey: treasuryToken, isWritable: true, isSigner: false },
-      ])
-      .signers([buyer])
-      .rpc();
-
-    const fee1 = unit(30).muln(FEE_BPS).divn(10_000);
-    const fee2 = unit(50).muln(FEE_BPS).divn(10_000);
-
-    const p1 = await program.account.payment.fetch(payment1);
-    const p2 = await program.account.payment.fetch(payment2);
-    assert.deepEqual(p1.status, { settled: {} });
-    assert.deepEqual(p2.status, { settled: {} });
-    assert.equal(p1.feeAmount.toString(), fee1.toString());
-    assert.equal(p2.feeAmount.toString(), fee2.toString());
-
+  it("refund_escrow no longer exists — an order resolves only by fulfillment or the clock", () => {
     assert.equal(
-      (await getAccount(provider.connection, token1)).amount.toString(),
-      unit(30).sub(fee1).toString(),
-      "merchant 1 receives their order minus its fee"
+      (program.methods as any).refundEscrow,
+      undefined,
+      "the mutual refund path was removed: it was the one way to reverse an order for free"
     );
-    assert.equal(
-      (await getAccount(provider.connection, token2)).amount.toString(),
-      unit(50).sub(fee2).toString(),
-      "merchant 2 receives their order minus its fee"
-    );
-
-    const treasuryAfter = (await getAccount(provider.connection, treasuryToken)).amount;
-    assert.equal(
-      (treasuryAfter - treasuryBefore).toString(),
-      fee1.add(fee2).toString(),
-      "the treasury collects both orders' fees from the one batched transaction"
-    );
-
-    // Both vaults close once emptied, exactly as a single confirm_delivery would.
-    assert.equal(await provider.connection.getAccountInfo(vault1), null);
-    assert.equal(await provider.connection.getAccountInfo(vault2), null);
   });
-
-  it("rejects a batch whose account count is not a multiple of 4", async () => {
-    const { owner, token } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(12);
-    const { payment, vault } = await pay(owner.publicKey, buyerToken, unit(20), orderId);
-
-    try {
-      await program.methods
-        .batchConfirmDelivery()
-        .accounts({
-          buyer: buyer.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .remainingAccounts([
-          { pubkey: payment, isWritable: true, isSigner: false },
-          { pubkey: vault, isWritable: true, isSigner: false },
-          { pubkey: token, isWritable: true, isSigner: false },
-          // treasuryToken deliberately omitted: 3 accounts, not a multiple of 4.
-        ])
-        .signers([buyer])
-        .rpc();
-      assert.fail("expected a non-multiple-of-4 batch to be rejected");
-    } catch (err) {
-      assert.ok(
-        String(err).includes("InvalidBatchSize"),
-        `expected InvalidBatchSize, got: ${err}`
-      );
-    }
-  });
-
-  it("after the timeout the buyer recovers the escrow alone", async () => {
-    const { owner, token } = await newMerchant();
-    const buyerToken = await fundedBuyerToken(unit(100));
-    const orderId = new BN(9);
-    // 61s is the shortest the program allows; the wait below is real.
-    const { payment } = await pay(owner.publicKey, buyerToken, unit(40), orderId, 61);
-
-    await new Promise((r) => setTimeout(r, 62_000));
-
-    await program.methods
-      .reclaimTimeout(orderId)
-      .accounts({
-        payment,
-        buyer: buyer.publicKey,
-        escrowVault: vaultPda(payment),
-        buyerToken,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([buyer]) // the merchant is not a signer here, and cannot block it
-      .rpc();
-
-    const p = await program.account.payment.fetch(payment);
-    assert.deepEqual(p.status, { reclaimed: {} });
-    assert.equal(p.feeAmount.toNumber(), 0, "a reclaimed order must not charge a fee");
-    assert.equal(
-      (await getAccount(provider.connection, buyerToken)).amount.toString(),
-      unit(100).toString()
-    );
-    assert.equal((await getAccount(provider.connection, token)).amount.toString(), "0");
-    // The vault is closed once emptied.
-    assert.equal(await provider.connection.getAccountInfo(vaultPda(payment)), null);
-  }).timeout(150_000);
-
-  it("initiate_pooled_payment merges two buyers into one escrowed order", async () => {
-    const { owner, token } = await newMerchant();
-    const a = await fundedContributor(unit(30));
-    const b = await fundedContributor(unit(70));
-
-    const orderId = new BN(20);
-    const payment = pooledPaymentPda(a.keypair.publicKey, owner.publicKey, orderId);
-    const vault = pooledVaultPda(payment);
-
-    await program.methods
-      .initiatePooledPayment(orderId, new BN(3600), [unit(30), unit(70)])
-      .accounts({
-        payment,
-        merchant: owner.publicKey,
-        coordinator: a.keypair.publicKey,
-        escrowVault: vault,
-        mint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .remainingAccounts([
-        { pubkey: a.keypair.publicKey, isWritable: false, isSigner: true },
-        { pubkey: a.token, isWritable: true, isSigner: false },
-        { pubkey: b.keypair.publicKey, isWritable: false, isSigner: true },
-        { pubkey: b.token, isWritable: true, isSigner: false },
-      ])
-      .signers([a.keypair, b.keypair])
-      .rpc();
-
-    const p: any = await program.account.pooledPayment.fetch(payment);
-    assert.equal(p.amount.toString(), unit(100).toString());
-    assert.equal(p.contributorCount, 2);
-    assert.equal(p.coordinator.toBase58(), a.keypair.publicKey.toBase58());
-    assert.equal((await getAccount(provider.connection, vault)).amount.toString(), unit(100).toString());
-    assert.equal((await getAccount(provider.connection, a.token)).amount.toString(), "0");
-    assert.equal((await getAccount(provider.connection, b.token)).amount.toString(), "0");
-
-    const treasuryBefore = (await getAccount(provider.connection, treasuryToken)).amount;
-    await program.methods
-      .confirmPooledDelivery(orderId)
-      .accounts({
-        payment,
-        coordinator: a.keypair.publicKey,
-        escrowVault: vault,
-        merchantToken: token,
-        treasuryToken,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([a.keypair])
-      .rpc();
-
-    const fee = unit(100).muln(FEE_BPS).divn(10_000);
-    const p2: any = await program.account.pooledPayment.fetch(payment);
-    assert.deepEqual(p2.status, { settled: {} });
-    assert.equal(
-      (await getAccount(provider.connection, token)).amount.toString(),
-      unit(100).sub(fee).toString(),
-      "the merchant receives the pooled order minus the settlement fee"
-    );
-    assert.equal(
-      ((await getAccount(provider.connection, treasuryToken)).amount - treasuryBefore).toString(),
-      fee.toString()
-    );
-    assert.equal(await provider.connection.getAccountInfo(vault), null);
-  });
-
-  it("reclaim_pooled_timeout refunds each contributor their own amount, with no signer required", async () => {
-    const { owner } = await newMerchant();
-    const a = await fundedContributor(unit(15));
-    const b = await fundedContributor(unit(25));
-
-    const orderId = new BN(21);
-    const payment = pooledPaymentPda(a.keypair.publicKey, owner.publicKey, orderId);
-    const vault = pooledVaultPda(payment);
-
-    // 61s is the shortest timeout the program allows; the wait below is real.
-    await program.methods
-      .initiatePooledPayment(orderId, new BN(61), [unit(15), unit(25)])
-      .accounts({
-        payment,
-        merchant: owner.publicKey,
-        coordinator: a.keypair.publicKey,
-        escrowVault: vault,
-        mint,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-        rent: SYSVAR_RENT_PUBKEY,
-      })
-      .remainingAccounts([
-        { pubkey: a.keypair.publicKey, isWritable: false, isSigner: true },
-        { pubkey: a.token, isWritable: true, isSigner: false },
-        { pubkey: b.keypair.publicKey, isWritable: false, isSigner: true },
-        { pubkey: b.token, isWritable: true, isSigner: false },
-      ])
-      .signers([a.keypair, b.keypair])
-      .rpc();
-
-    await new Promise((r) => setTimeout(r, 62_000));
-
-    // No .signers() at all — reclaim_pooled_timeout takes no signer, only
-    // the clock, and the default provider wallet pays for this transaction
-    // despite not being a contributor itself.
-    await program.methods
-      .reclaimPooledTimeout(orderId)
-      .accounts({
-        payment,
-        coordinator: a.keypair.publicKey,
-        escrowVault: vault,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .remainingAccounts([
-        { pubkey: a.token, isWritable: true, isSigner: false },
-        { pubkey: b.token, isWritable: true, isSigner: false },
-      ])
-      .rpc();
-
-    const p: any = await program.account.pooledPayment.fetch(payment);
-    assert.deepEqual(p.status, { reclaimed: {} });
-    assert.equal(p.feeAmount.toNumber(), 0, "a reclaimed pooled order must not charge a fee");
-    assert.equal(
-      (await getAccount(provider.connection, a.token)).amount.toString(),
-      unit(15).toString(),
-      "contributor A gets back exactly their own contribution"
-    );
-    assert.equal(
-      (await getAccount(provider.connection, b.token)).amount.toString(),
-      unit(25).toString(),
-      "contributor B gets back exactly their own contribution"
-    );
-    assert.equal(await provider.connection.getAccountInfo(vault), null);
-  }).timeout(150_000);
 });
