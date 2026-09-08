@@ -1,0 +1,551 @@
+<title>Agent CTOS Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap">
+
+<style>
+  /* Deck palette. The violet→teal gradient is DECORATIVE only — it fails
+     colorblind separation (purple↔blue ΔE 0.3 deutan), so it never carries
+     data. Chart series use --s1/--s2/--s3, which pass all six checks against
+     this surface: lightness band, chroma, CVD, normal-vision, contrast. */
+  :root {
+    --ink:#000000; --panel:#0B0B0D; --line:#26262C;
+    --text-1:#FFFFFF; --text-2:#A1A1AA; --text-3:#71717A;
+
+    --g1:#A78BFA; --g2:#60A5FA; --g3:#2DD4BF; --g4:#4ADE80;  /* headings only */
+    --s1:#8B5CF6; --s2:#0891B2; --s3:#EA580C;                /* data series */
+    --hot:#F87171; --good:#4ADE80; --warn:#FBBF24;
+
+    --f-display:"Archivo",system-ui,sans-serif;
+    --f-sans:"Inter",system-ui,-apple-system,sans-serif;
+    --f-mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+  }
+
+  * { box-sizing:border-box; }
+  body { margin:0; background:#18181B; color:var(--text-1);
+    font-family:var(--f-sans); -webkit-font-smoothing:antialiased; }
+
+  .rail { display:flex; flex-direction:column; align-items:center; gap:24px; padding:24px; }
+
+  /* Each slide is a fixed 1280×720 block: screenshot one and it drops
+     straight into Canva at 16:9 with no reflow. */
+  .slide {
+    width:1280px; height:720px; flex:none; position:relative; overflow:hidden;
+    background:var(--ink); color:var(--text-1);
+    padding:56px 64px; display:flex; flex-direction:column; gap:20px;
+  }
+  .slide-head { display:flex; justify-content:space-between; align-items:baseline;
+    font-family:var(--f-mono); font-size:12px; letter-spacing:0.14em;
+    text-transform:uppercase; color:var(--text-3); }
+  .slide-no { font-variant-numeric:tabular-nums; }
+
+  h1 { margin:0; font-family:var(--f-display); font-weight:800;
+    font-size:60px; line-height:0.98; letter-spacing:-0.02em; text-transform:uppercase;
+    background:linear-gradient(96deg,var(--g1),var(--g2) 38%,var(--g3) 72%,var(--g4));
+    -webkit-background-clip:text; background-clip:text; color:transparent; text-wrap:balance; }
+  h2 { margin:0; font-family:var(--f-display); font-weight:700; font-size:40px;
+    line-height:1.02; letter-spacing:-0.015em; text-transform:uppercase;
+    background:linear-gradient(96deg,var(--g1),var(--g3));
+    -webkit-background-clip:text; background-clip:text; color:transparent; text-wrap:balance; }
+  .lede { margin:0; font-size:19px; line-height:1.5; color:var(--text-2); max-width:74ch; }
+  .lede b { color:var(--text-1); font-weight:600; }
+
+  .cols { display:grid; gap:16px; flex:1; min-height:0; }
+  .c2 { grid-template-columns:1fr 1fr; }
+  .c3 { grid-template-columns:1fr 1fr 1fr; }
+  .c25 { grid-template-columns:1.25fr 1fr; }
+
+  .box { border:1px solid var(--line); border-radius:12px; padding:20px 22px;
+    display:flex; flex-direction:column; gap:10px; min-width:0; background:var(--panel); }
+  .box.v { border-color:color-mix(in srgb,var(--s1) 55%,transparent); }
+  .box.t { border-color:color-mix(in srgb,var(--s2) 55%,transparent); }
+  .box.o { border-color:color-mix(in srgb,var(--s3) 55%,transparent); }
+  .box-t { font-family:var(--f-mono); font-size:11px; font-weight:600; letter-spacing:0.14em;
+    text-transform:uppercase; color:var(--text-3); }
+  .box h3 { margin:0; font-size:20px; font-weight:600; line-height:1.25; }
+
+  ul { margin:0; padding-left:18px; display:flex; flex-direction:column; gap:9px; }
+  li { font-size:15px; line-height:1.45; color:var(--text-2); }
+  li b, li strong { color:var(--text-1); font-weight:600; }
+  .hot { color:var(--hot); font-weight:600; }
+  .grn { color:var(--good); font-weight:600; }
+  .amb { color:var(--warn); font-weight:600; }
+
+  /* stat tiles — a hero number is the right form for a single figure */
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  .stat { border:1px solid var(--line); border-radius:12px; padding:16px 18px;
+    background:var(--panel); display:flex; flex-direction:column; gap:4px; }
+  .stat .n { font-family:var(--f-display); font-weight:800; font-size:34px; line-height:1;
+    font-variant-numeric:tabular-nums; letter-spacing:-0.02em; }
+  .stat .l { font-size:12.5px; color:var(--text-2); line-height:1.35; }
+  .stat .src { font-family:var(--f-mono); font-size:10px; color:var(--text-3); letter-spacing:0.04em; }
+
+  /* timeline — structural, because the order genuinely carries the argument */
+  .tl { display:flex; flex-direction:column; gap:0; margin-top:2px; }
+  .tl-row { display:grid; grid-template-columns:78px 14px 1fr; gap:10px; align-items:start;
+    padding-bottom:13px; }
+  .tl-when { font-family:var(--f-mono); font-size:11px; color:var(--text-3);
+    letter-spacing:0.04em; padding-top:1px; }
+  .tl-mark { position:relative; height:100%; display:flex; justify-content:center; }
+  .tl-dot { width:9px; height:9px; border-radius:50%; background:var(--s2); margin-top:4px; flex:none; z-index:1; }
+  .tl-row:last-child .tl-dot { background:var(--s3); }
+  .tl-line { position:absolute; top:10px; bottom:-13px; width:1px; background:var(--line); }
+  .tl-row:last-child .tl-line { display:none; }
+  .tl-what { font-size:13.5px; line-height:1.35; color:var(--text-2); }
+  .tl-what b { color:var(--text-1); font-weight:600; }
+
+  table { border-collapse:collapse; width:100%; font-size:13.5px; }
+  th { text-align:left; font-family:var(--f-mono); font-size:10.5px; font-weight:600;
+    letter-spacing:0.1em; text-transform:uppercase; color:var(--text-3);
+    padding:0 10px 9px 0; border-bottom:1px solid var(--line); }
+  td { padding:10px 10px 10px 0; border-bottom:1px solid var(--line);
+    color:var(--text-2); vertical-align:top; line-height:1.35; }
+  td:first-child { color:var(--text-1); font-weight:600; white-space:nowrap; }
+  tr:last-child td { border-bottom:0; }
+  .us td { background:color-mix(in srgb,var(--s1) 12%,transparent); }
+  .us td:first-child { color:var(--g1); }
+
+  /* Slide 7 carries seven rows; the space has to come out of the layout,
+     not the copy — trimming sentences did not change the wrapped line count. */
+  .slide.tight { gap:12px; }
+  .slide.tight h2 { font-size:32px; }
+  table.compact { font-size:12px; }
+  table.compact td { padding:5px 10px 5px 0; line-height:1.28; }
+  table.compact th { padding:0 10px 6px 0; }
+
+  .foot { font-family:var(--f-mono); font-size:10.5px; color:var(--text-3);
+    letter-spacing:0.04em; line-height:1.5; }
+  code { font-family:var(--f-mono); font-size:0.92em; color:var(--g3); }
+
+  .note { position:sticky; top:0; background:#18181B; color:var(--text-2);
+    font-family:var(--f-mono); font-size:12px; padding:10px 16px; border:1px solid var(--line);
+    border-radius:8px; text-align:center; max-width:1280px; }
+  @media print {
+    body { background:#000; } .rail { gap:0; padding:0; } .note { display:none; }
+    .slide { page-break-after:always; }
+  }
+</style>
+
+<div class="rail">
+  <div class="note">
+    Each block below is exactly 1280×720. Screenshot one and paste it into Canva at 16:9 — or print this page to PDF for a deck with no Canva step at all.
+  </div>
+
+  <!-- ============================ 01 TITLE ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Agent CTOS</span><span class="slide-no">01</span></div>
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:26px">
+      <h1>Agents can finally pay.<br>Nobody made it safe to.</h1>
+      <p class="lede" style="font-size:22px;max-width:70ch">
+        <b>Agent CTOS is escrow for x402 payments, priced by collateral instead of trust.</b>
+        A merchant posts its own money as a bond; the protocol pays instantly only up to
+        that bond, and claws it back automatically if delivery never happens — with no
+        identity, no score, and no signature from the merchant.
+      </p>
+      <div class="stats" style="grid-template-columns:repeat(3,1fr);max-width:900px">
+        <div class="stat"><div class="n" style="color:var(--g3)">Live</div>
+          <div class="l">Deployed and running on Solana devnet</div></div>
+        <div class="stat"><div class="n" style="color:var(--g2)">14/14</div>
+          <div class="l">Program tests passing</div></div>
+        <div class="stat"><div class="n" style="color:var(--g1)">5 acts</div>
+          <div class="l">Rug survived live, on-chain, in 90 seconds</div></div>
+      </div>
+    </div>
+    <div class="foot">Thomas Marcus · Solana devnet <code>HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4</code></div>
+  </section>
+
+  <!-- ============================ 02 PROBLEM ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Problem</span><span class="slide-no">02</span></div>
+    <h2>The rails shipped. The money didn't follow.</h2>
+    <p class="lede">
+      x402 made agent payments instant, cheap and <b>irreversible</b>. Irreversible is the
+      product — and the problem. Stablecoin settlement removed the chargeback, and with it
+      the safety net for <b>both</b> sides.
+    </p>
+
+    <div class="stats">
+      <div class="stat"><div class="n" style="color:var(--g2)">167M</div>
+        <div class="l">x402 transactions settled by Q1 2026</div>
+        <div class="src">Standard adoption: strong</div></div>
+      <div class="stat"><div class="n hot">$28K</div>
+        <div class="l">Actual commerce volume — per <em>day</em>, across the whole protocol</div>
+        <div class="src">Commercial adoption: not yet</div></div>
+      <div class="stat"><div class="n hot">~50%</div>
+        <div class="l">Of that activity classified as gamified, not real trade</div>
+        <div class="src">Artemis on-chain analysis</div></div>
+      <div class="stat"><div class="n amb">$0.20</div>
+        <div class="l">Average payment size — nobody risks a real basket</div>
+        <div class="src">Q1 2026 daily snapshots</div></div>
+    </div>
+
+    <div class="cols c2">
+      <div class="box o">
+        <div class="box-t">Why the volume stays tiny</div>
+        <ul>
+          <li>An agent paying an unknown merchant has <span class="hot">zero recourse</span> — no chargeback, no dispute, no reversal.</li>
+          <li>An honest unknown merchant has <b>no way to prove it is safe</b> without submitting to a gatekeeper.</li>
+          <li>So agents only spend amounts they can afford to lose. <b>$0.20 at a time.</b></li>
+        </ul>
+      </div>
+      <div class="box o">
+        <div class="box-t">And it is about to get worse</div>
+        <ul>
+          <li>Only <span class="hot">29%</span> of merchants say they feel very prepared for agentic commerce fraud.</li>
+          <li>New dispute types fit no existing reason code — agent buys the wrong thing, or exceeds its mandate.</li>
+          <li>Liability is genuinely unresolved: merchant, agent vendor, protocol, or user?</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ 03 SOLUTION ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Solution</span><span class="slide-no">03</span></div>
+    <h2>Don't identify the merchant. Bound the loss.</h2>
+    <p class="lede">
+      Every other answer tries to work out <b>who deserves trust</b>. We removed the question.
+      A merchant posts collateral on-chain; the router pays instantly only up to what that
+      merchant has actually put at risk. <b>No score, no tier, no identity, no committee.</b>
+    </p>
+
+    <div class="cols c3">
+      <div class="box v">
+        <div class="box-t">1 · Merchant posts a bond</div>
+        <h3>Collateral, not credentials</h3>
+        <ul>
+          <li>Merchant opens a reserve and funds it with its <b>own tokens</b>.</li>
+          <li>That reserve is the ceiling on how much can ever be paid out instantly.</li>
+          <li>Anyone can post. Nobody gets approved.</li>
+        </ul>
+      </div>
+      <div class="box t">
+        <div class="box-t">2 · The router splits the order</div>
+        <h3>Instant + escrowed</h3>
+        <ul>
+          <li>New buyer → <b>full escrow</b>, even against a fully collateralized merchant.</li>
+          <li>Settled history + posted bond → <b>instant</b>, with no fee on the instant part.</li>
+          <li>The split is computed on-chain, per order.</li>
+        </ul>
+      </div>
+      <div class="box o">
+        <div class="box-t">3 · The rug costs the rugger</div>
+        <h3>Reclaim, then skim</h3>
+        <ul>
+          <li>No delivery → after timeout the buyer reclaims the escrow.</li>
+          <li>The instant portion is <b>skimmed out of the merchant's own reserve</b>.</li>
+          <li><span class="grn">No merchant signature required.</span> It cannot be blocked.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="box" style="flex:0 0 auto;border-color:color-mix(in srgb,var(--g4) 45%,transparent)">
+      <p style="margin:0;font-size:17px;line-height:1.45;color:var(--text-1)">
+        The loss is bounded <b>before</b> anyone has to detect fraud. Fake reputation cannot
+        beat it, because there is no reputation to fake — only money the merchant already staked.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============================ 04 DEMO ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Demo</span><span class="slide-no">04</span></div>
+    <h2>Watch it survive a rug, live</h2>
+    <p class="lede">
+      Five acts against real Solana devnet. Every figure is read back from on-chain
+      accounts; every act links to the transaction on Solana Explorer.
+    </p>
+    <div class="cols" style="grid-template-columns:1fr;gap:10px;flex:1">
+      <div class="box t" style="flex-direction:row;align-items:center;gap:18px;padding:14px 20px">
+        <div class="box-t" style="width:56px;flex:none;color:var(--s2)">Act 1</div>
+        <div style="flex:1"><b>A merchant posts 100 tokens of collateral</b>; a fresh buyer registers with zero settled orders.</div>
+      </div>
+      <div class="box t" style="flex-direction:row;align-items:center;gap:18px;padding:14px 20px">
+        <div class="box-t" style="width:56px;flex:none;color:var(--s2)">Act 2</div>
+        <div style="flex:1">First order, 30 tokens → <b>instant 0.000, escrowed 30.000</b>. Full protection despite a fully funded merchant, because standing is still zero.</div>
+      </div>
+      <div class="box t" style="flex-direction:row;align-items:center;gap:18px;padding:14px 20px">
+        <div class="box-t" style="width:56px;flex:none;color:var(--s2)">Act 3</div>
+        <div style="flex:1">Same buyer, next order, 60 tokens → <b>instant 60.000, escrowed 0.000</b>. Paid in full before any confirmation, no fee on the instant portion.</div>
+      </div>
+      <div class="box o" style="flex-direction:row;align-items:center;gap:18px;padding:14px 20px">
+        <div class="box-t" style="width:56px;flex:none;color:var(--s3)">Act 4</div>
+        <div style="flex:1">A second merchant posts 40, takes a <b>40-token instant order</b> — and vanishes. This is the rug.</div>
+      </div>
+      <div class="box" style="flex-direction:row;align-items:center;gap:18px;padding:14px 20px;border-color:color-mix(in srgb,var(--good) 50%,transparent)">
+        <div class="box-t" style="width:56px;flex:none;color:var(--good)">Act 5</div>
+        <div style="flex:1"><b class="grn">Buyer recovers 40.000 — the entire order, instant portion included</b> — straight out of the rugger's reserve. The rugger's balance goes to 0.000. No merchant signature anywhere in that transaction.</div>
+      </div>
+    </div>
+    <div class="foot">Runs in the browser at <code>/live.html</code> — no wallet needed — or as <code>npm run demo</code> in a terminal.</div>
+  </section>
+
+  <!-- ============================ 05 TRACTION ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Traction &amp; business model</span><span class="slide-no">05</span></div>
+    <h2>Built, deployed, and callable by any agent</h2>
+    <div class="cols c25">
+      <div class="box v">
+        <div class="box-t">What exists today</div>
+        <ul>
+          <li><b>Anchor program live on devnet</b> — nine instructions covering reserves, routing, escrow, claim, dispute and timeout reclaim.</li>
+          <li><b>14/14 tests passing</b>, including the adversarial paths: reclaim before expiry, double settle, wrong-token-owner, and reserve withdrawal against locked exposure.</li>
+          <li><b>Five-act live demo</b> proving the rug case end to end on real devnet.</li>
+          <li><b>MCP server</b> — any Claude or MCP-speaking agent can call <code>pay_merchant</code> and <code>reclaim_payment</code> as tools. The escrow is agent-native, not a dashboard.</li>
+          <li><b>Browser demo</b> that runs the whole thing with no wallet on the visitor's side.</li>
+        </ul>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+        <div class="box t">
+          <div class="box-t">How we make money</div>
+          <ul>
+            <li><b>0.50% on the escrowed portion only.</b> Zero fee on anything paid instantly.</li>
+            <li>We are paid <b>exactly when protection is used</b> — the fee tracks risk, like an insurance premium, not a toll.</li>
+            <li>As a merchant posts more collateral its orders route instant, and <b>its fees fall to zero</b>. The incentive points the right way.</li>
+          </ul>
+        </div>
+        <div class="box o">
+          <div class="box-t">What is not revenue</div>
+          <ul>
+            <li>The skimmed reserve goes <b>entirely to the wronged buyer</b>. We take nothing from a rug.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ 06 MARKET ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Market · Why now · Why Solana</span><span class="slide-no">06</span></div>
+    <h2>The buyers arrived before the safety did</h2>
+
+    <div class="cols c3" style="flex:1">
+      <div class="box">
+        <div class="box-t">Market — agentic commerce</div>
+        <svg viewBox="0 0 380 300" width="100%" height="auto" role="img" style="flex:1;min-height:0"
+             aria-label="Agentic commerce market size growing from 7.7 billion dollars in 2026 to 65.5 billion in 2033.">
+          <!-- recessive grid -->
+          <g stroke="#26262C" stroke-width="1">
+            <line x1="44" y1="16" x2="366" y2="16"/>
+            <line x1="44" y1="86" x2="366" y2="86"/>
+            <line x1="44" y1="156" x2="366" y2="156"/>
+            <line x1="44" y1="225" x2="366" y2="225"/>
+          </g>
+          <line x1="44" y1="260" x2="366" y2="260" stroke="#3F3F46" stroke-width="1"/>
+          <g fill="#71717A" font-family="JetBrains Mono, monospace" font-size="10">
+            <text x="38" y="19" text-anchor="end">$70B</text>
+            <text x="38" y="89" text-anchor="end">$50B</text>
+            <text x="38" y="159" text-anchor="end">$30B</text>
+            <text x="38" y="228" text-anchor="end">$10B</text>
+            <text x="44" y="278">2026</text>
+            <text x="366" y="278" text-anchor="end">2033</text>
+          </g>
+          <!-- area + line: one series, so no legend; endpoints direct-labelled -->
+          <defs>
+            <linearGradient id="mkt" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.42"/>
+              <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0.02"/>
+            </linearGradient>
+          </defs>
+          <path fill="url(#mkt)"
+                d="M44,233 L90,224 L136,211 L182,193 L228,170 L274,136 C297,116 320,83 366,32 L366,260 L44,260 Z"/>
+          <path fill="none" stroke="#8B5CF6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                d="M44,233 L90,224 L136,211 L182,193 L228,170 L274,136 C297,116 320,83 366,32"/>
+          <circle cx="44" cy="233" r="4.5" fill="#8B5CF6" stroke="#0B0B0D" stroke-width="2"/>
+          <circle cx="366" cy="32" r="5" fill="#8B5CF6" stroke="#0B0B0D" stroke-width="2"/>
+          <g font-family="Archivo, sans-serif" font-weight="700" font-size="15" fill="#FFFFFF">
+            <text x="54" y="228">$7.7B</text>
+            <text x="358" y="26" text-anchor="end">$65.5B</text>
+          </g>
+        </svg>
+        <div class="foot" style="margin-top:-2px">35.7% CAGR, 2026→2033. Bain puts the US alone at $300–500B by 2030.</div>
+      </div>
+
+      <div class="box">
+        <div class="box-t">Why now — web2 already moved</div>
+        <div class="tl">
+          <div class="tl-row"><div class="tl-when">Apr 2025</div>
+            <div class="tl-mark"><span class="tl-line"></span><span class="tl-dot"></span></div>
+            <div class="tl-what"><b>Mastercard Agent Pay</b> — agentic tokens for verified agents</div></div>
+          <div class="tl-row"><div class="tl-when">Sep 2025</div>
+            <div class="tl-mark"><span class="tl-line"></span><span class="tl-dot"></span></div>
+            <div class="tl-what"><b>Visa Trusted Agent Protocol</b> — a Visa-issued Verified Agent ID</div></div>
+          <div class="tl-row"><div class="tl-when">Sep 2025</div>
+            <div class="tl-mark"><span class="tl-line"></span><span class="tl-dot"></span></div>
+            <div class="tl-what"><b>OpenAI + Stripe</b> ship Agentic Commerce Protocol; Instant Checkout goes live</div></div>
+          <div class="tl-row"><div class="tl-when">2025</div>
+            <div class="tl-mark"><span class="tl-line"></span><span class="tl-dot"></span></div>
+            <div class="tl-what"><b>Google AP2</b> — open agent payments standard</div></div>
+          <div class="tl-row"><div class="tl-when">Apr 2026</div>
+            <div class="tl-mark"><span class="tl-line"></span><span class="tl-dot"></span></div>
+            <div class="tl-what"><b>Linux Foundation formalizes the x402 Foundation</b> — 22 members incl. Visa, Mastercard, Stripe, Shopify, AWS, Google, Amex, Circle, Solana Foundation</div></div>
+        </div>
+        <div class="foot">Four rails shipped in six months. The demand is not speculative — it is scheduled.</div>
+      </div>
+
+      <div class="box">
+        <div class="box-t">Why Solana</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div style="font-family:var(--f-display);font-weight:800;font-size:56px;line-height:1;color:var(--s2);font-variant-numeric:tabular-nums">65%</div>
+          <div style="font-size:14px;color:var(--text-2);line-height:1.4">
+            of agent-to-agent payment volume settled on <b style="color:#fff">Solana</b> by Q1 2026 — already the dominant settlement layer.
+          </div>
+        </div>
+        <!-- single proportion: a bar, direct-labelled, no legend needed -->
+        <svg viewBox="0 0 300 26" width="100%" height="auto" role="img" aria-label="Solana holds 65% of agent-to-agent payment volume; all other chains 35%.">
+          <rect x="0" y="4" width="300" height="18" rx="4" fill="#26262C"/>
+          <rect x="0" y="4" width="195" height="18" rx="4" fill="#0891B2"/>
+          <rect x="197" y="4" width="103" height="18" rx="4" fill="#3F3F46"/>
+        </svg>
+        <ul style="margin-top:2px">
+          <li><b>Sub-cent fees.</b> A 0.50% fee on a $2 order has to survive gas; on most chains it does not.</li>
+          <li><b>Sub-second finality.</b> An escrow that takes a minute to confirm is not an instant payment rail.</li>
+          <li><b>Rent-cheap PDAs</b> make a per-order escrow account economically sane at micro-payment sizes.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot">Sources: Grand View Research · Bain · Artemis on-chain analysis · Chainalysis · Coinbase / Cloudflare / Linux Foundation announcements. Figures as of Q1 2026.</div>
+  </section>
+
+  <!-- ============================ 07 COMPETITION ============================ -->
+  <section class="slide tight">
+    <div class="slide-head"><span>Competition</span><span class="slide-no">07</span></div>
+    <h2>Everyone is building identity. We build recourse.</h2>
+    <p class="lede" style="font-size:16px">
+      The field converged on one answer — <b>verify the agent, then permit the payment</b>.
+      That reintroduces the gatekeeper crypto payments were meant to remove, and still leaves
+      the buyer with nothing when a <em>verified</em> merchant simply fails to deliver.
+    </p>
+    <table class="compact">
+      <thead><tr>
+        <th style="width:150px">Who</th><th style="width:190px">What they actually do</th>
+        <th>The gap it leaves</th>
+      </tr></thead>
+      <tbody>
+        <tr><td>Skyfire</td><td>KYA — "know your agent" identity and wallets ($8.5M seed)</td>
+          <td>Identity is not recourse. A <em>verified</em> merchant that takes the money and vanishes is still gone.</td></tr>
+        <tr><td>Nevermined</td><td>Agent-native payments, metering, access control; escrow available for high-value work</td>
+          <td>Closest to us — but escrow is a platform feature with dispute handling, not merchant capital at stake. Someone still adjudicates.</td></tr>
+        <tr><td>Payman</td><td>Controlled banking automation with human-set spend limits</td>
+          <td>Caps the buyer's spend rather than making the seller liable. A capped loss is still a loss.</td></tr>
+        <tr><td>Visa TAP · Mastercard Agent Pay</td><td>Network-issued agent credentials on card rails</td>
+          <td>Recourse exists, but it is the chargeback — permissioned, days long, and closed to merchants without a card-network relationship.</td></tr>
+        <tr><td>Stripe ACP · Google AP2</td><td>Open protocols for agent checkout at the processor layer</td>
+          <td>Standardize how an agent pays, deliberately not who is liable when delivery fails. Complementary, not competitive.</td></tr>
+        <tr><td>x402 itself</td><td>The payment rail we settle on</td>
+          <td>Intentionally minimal: it moves money and stops. What happens next is our entire product.</td></tr>
+        <tr class="us"><td>Agent CTOS</td><td>Merchant-posted collateral, on-chain routing, automatic skim on timeout</td>
+          <td><b>The only one where the seller's own money is the guarantee</b> — permissionless to join, enforceable without the seller's cooperation or anyone's judgement.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================ 08 GTM ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>GTM · 3-month plan</span><span class="slide-no">08</span></div>
+    <h2>Earn mainnet. Don't just deploy to it.</h2>
+    <p class="lede">
+      This program holds other people's money and pays out without a human in the loop.
+      The plan is a <b>deliberate promotion path</b> — devnet to testnet to mainnet — where
+      each stage has an exit bar it has to clear before the next one starts.
+    </p>
+    <div class="cols c3" style="flex:1">
+      <div class="box v">
+        <div class="box-t">Month 1 · Devnet — break it on purpose</div>
+        <ul>
+          <li><b>Adversarial test suite:</b> reclaim races, double-settle, reserve withdrawal mid-exposure, order-id collision, malicious token mints.</li>
+          <li><b>Fuzz the router</b> across the full amount × standing × reserve space; assert instant + escrowed always equals the order and never exceeds the bond.</li>
+          <li><b>Soak test:</b> thousands of orders to find PDA rent, account-size and compute-budget ceilings.</li>
+          <li><span class="grn">Exit bar:</span> no invariant violation in 10k randomized orders.</li>
+        </ul>
+      </div>
+      <div class="box t">
+        <div class="box-t">Month 2 · Testnet — break it under load</div>
+        <ul>
+          <li>Deploy to testnet and run against <b>real validator conditions</b> — congestion, forks, dropped blockhashes.</li>
+          <li><b>Concurrency:</b> many buyers against one merchant's reserve at once, proving locked exposure can never be oversubscribed.</li>
+          <li><b>Economic simulation:</b> model a rational rugger and confirm the reserve makes rugging unprofitable at every order size.</li>
+          <li>External review of the program and a public bug bounty on testnet funds.</li>
+          <li><span class="grn">Exit bar:</span> clean review, no critical findings open.</li>
+        </ul>
+      </div>
+      <div class="box o">
+        <div class="box-t">Month 3 · Mainnet — small, capped, real</div>
+        <ul>
+          <li><b>Capped beta:</b> hard per-order and per-reserve limits in the program itself, raised only on evidence.</li>
+          <li>Launch with <b>10 real agent↔merchant pairs</b> — the x402 service directories are where they already are.</li>
+          <li>Distribution is the MCP server: any Claude or agent framework adds escrowed pay as <b>one tool</b>, no integration project.</li>
+          <li><span class="grn">Exit bar:</span> 10 merchants with live collateral and a real rug survived on mainnet.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ 09 TEAM ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>Team</span><span class="slide-no">09</span></div>
+    <h2>Why us</h2>
+    <div class="cols c2" style="flex:1">
+      <div class="box v">
+        <div class="box-t">Thomas Marcus</div>
+        <h3>Replace this with your own two or three lines</h3>
+        <ul>
+          <li>What you have shipped before that makes escrow-holding code a reasonable thing to hand you.</li>
+          <li>Any Solana, payments, or security background — this is the slide where that is worth the most.</li>
+          <li>Why you personally care that agent payments end up safe rather than merely fast.</li>
+        </ul>
+      </div>
+      <div class="box t">
+        <div class="box-t">What this build already shows</div>
+        <ul>
+          <li>A working Anchor program with <b>adversarial tests written before the happy path was polished</b>.</li>
+          <li>A demo that proves the <b>failure</b> case, not the success case — the rug is the thing being demonstrated.</li>
+          <li>Client tooling hardened against real devnet conditions: retries, blockhash-cache invalidation, credential redaction.</li>
+          <li>Honest accounting of what is not done yet — see slide 10.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot">Fill in the left box before submitting. Judges weight this slide heavily and a placeholder reads worse than two plain sentences.</div>
+  </section>
+
+  <!-- ============================ 10 ASK ============================ -->
+  <section class="slide">
+    <div class="slide-head"><span>The ask</span><span class="slide-no">10</span></div>
+    <h2>Fund the hardening, not the hype</h2>
+    <p class="lede">
+      The mechanism works — it is deployed and the rug case is proven on devnet. What it
+      has <b>not</b> had is the adversarial engineering that should stand between a
+      hackathon program and other people's money. <b>That gap is the ask.</b>
+    </p>
+    <div class="cols c25" style="flex:1">
+      <div class="box o">
+        <div class="box-t">What we already know is unfinished — found, not guessed</div>
+        <ul>
+          <li><b>No external audit.</b> Every bug found so far was found by us, which is exactly the wrong sample.</li>
+          <li><b>Real bugs this build has already surfaced:</b> accounts writable without being marked mutable (silently reverting every settlement), a buyer-standing PDA colliding across runs, merchants unable to pay their own PDA rent, transient RPC failures aborting whole runs.</li>
+          <li><b>Untested economics.</b> The instant/escrow split and the 0.50% fee are reasoned, not simulated against a rational adversary.</li>
+          <li><b>Dispute window is unproven.</b> <code>claim_fulfillment</code> and <code>finalize_claim</code> pass tests but have never been run adversarially at scale.</li>
+          <li><b>Concurrency is unvalidated.</b> Locked exposure has not been tested with many buyers racing one reserve.</li>
+        </ul>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div class="box v">
+          <div class="box-t">Where the money goes</div>
+          <ul>
+            <li><b>Security review + bug bounty</b> — the single largest line, and the one that gates mainnet.</li>
+            <li><b>Adversarial and economic simulation</b> — fuzzing, invariant testing, modelling a profitable rugger.</li>
+            <li><b>The devnet → testnet → mainnet promotion</b> on slide 8, with its exit bars.</li>
+          </ul>
+        </div>
+        <div class="box" style="border-color:color-mix(in srgb,var(--good) 45%,transparent)">
+          <div class="box-t" style="color:var(--good)">What you get for it</div>
+          <p style="margin:0;font-size:15px;line-height:1.45;color:var(--text-2)">
+            A settlement-safety layer that any x402 merchant can join without permission,
+            on the chain that already carries <b style="color:#fff">65% of agent-to-agent volume</b> —
+            audited, capped, and live on mainnet with real collateral behind it.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
