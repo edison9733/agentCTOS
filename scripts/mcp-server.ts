@@ -34,7 +34,7 @@ import { PublicKey, Keypair, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/w
 import {
   TOKEN_PROGRAM_ID,
   getMint,
-  getOrCreateAssociatedTokenAccount,
+  getOrCreateAssociatedTokenAccount as rawGetOrCreateAta,
 } from "@solana/spl-token";
 import * as fs from "fs";
 import * as path from "path";
@@ -67,6 +67,87 @@ const provider = new anchor.AnchorProvider(connection, env.wallet, {
   preflightCommitment: "confirmed",
 });
 anchor.setProvider(provider);
+
+/**
+ * Transient RPC failures — a blockhash the receiving node hasn't caught up to
+ * (load-balanced providers route the fetch and the send to different backends),
+ * rate limits, socket timeouts. All clear on a retry, because a retry fetches a
+ * fresh blockhash. A real program error is deliberately NOT in this list: it is
+ * rethrown at once, so a genuine failure still reaches the agent as a failed
+ * tool call with a useful message instead of being retried away.
+ *
+ * This matters more here than in the one-shot scripts. The server is
+ * long-running, so every transient blip over its whole lifetime would
+ * otherwise surface to the calling agent as a tool failure.
+ */
+const TRANSIENT =
+  /blockhash not found|block height exceeded|blockhash expired|429|too many requests|timed out|timeout|socket hang up|fetch failed|econnreset|node is behind|failed to get/i;
+
+/**
+ * web3.js caches the blockhash for 30s and `connection.sendTransaction` — the
+ * path the spl-token helpers take — reads that cache. The whole backoff
+ * schedule below fits inside 30s, so without this a retry would replay the
+ * exact blockhash that just failed. Dropping the cache forces a fresh one.
+ */
+function freshenBlockhash(conn: any) {
+  if (conn && conn._blockhashInfo) {
+    conn._blockhashInfo = {
+      latestBlockhash: null,
+      lastFetch: 0,
+      transactionSignatures: [],
+      simulatedSignatures: [],
+    };
+  }
+}
+
+async function rpc<T>(
+  label: string,
+  fn: () => Promise<T>,
+  conn?: any,
+  attempts = 6
+): Promise<T> {
+  let lastErr: any;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      const msg = `${e?.message ?? e} ${e?.transactionMessage ?? ""}`;
+      if (!TRANSIENT.test(msg) || i === attempts) throw e;
+      const backoff = Math.min(500 * 2 ** (i - 1), 8_000);
+      // stderr, never stdout: stdout is the MCP transport and must stay clean.
+      console.error(`[x402] ${label}: transient RPC error, retrying in ${backoff}ms`);
+      freshenBlockhash(conn);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr;
+}
+
+/** A breath after each send, so a burst of tool calls doesn't earn a 429. */
+const pace = () => new Promise((r) => setTimeout(r, 300));
+
+// Every `program.methods...rpc()` in this file funnels through
+// provider.sendAndConfirm, and every `program.account.*.fetch` (and getMint)
+// through connection.getAccountInfo. Wrapping those two chokepoints covers
+// them all at once, with no change at any call site.
+const sendAndConfirm = provider.sendAndConfirm.bind(provider);
+(provider as any).sendAndConfirm = async (tx: any, signers?: any, opts?: any) => {
+  const sig = await rpc("tx", () => sendAndConfirm(tx, signers, opts), connection);
+  await pace();
+  return sig;
+};
+const getAccountInfo = connection.getAccountInfo.bind(connection);
+(connection as any).getAccountInfo = (pubkey: any, cfg?: any) =>
+  rpc("getAccountInfo", () => getAccountInfo(pubkey, cfg), connection);
+
+// The spl-token helper sends its own transaction through its own
+// sendAndConfirmTransaction, so the provider wrapper above never sees it.
+const getOrCreateAssociatedTokenAccount: typeof rawGetOrCreateAta = async (...args) => {
+  const r = await rpc("getOrCreateAta", () => rawGetOrCreateAta(...args), args[0]);
+  await pace();
+  return r;
+};
 
 const program = loadProgram(provider);
 const wallet = (provider.wallet as anchor.Wallet).payer;
