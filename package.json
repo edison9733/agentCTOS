@@ -1,7 +1,7 @@
 {
   "name": "x402-scoring",
   "version": "0.1.0",
-  "description": "Agent CTOS x402 escrow for Solana: payments routed by posted merchant collateral and buyer standing, never by unverified reputation",
+  "description": "Agent CTOS x402 escrow on Solana: collateral-routed payments — instant settlement capped by the merchant's own posted reserve, with timeout reclaim skimming that reserve",
   "main": "target/types/x402_scoring.ts",
   "scripts": {
     "build": "anchor build",
@@ -9,7 +9,8 @@
     "deploy": "anchor deploy",
     "demo": "npx ts-node scripts/demo.ts",
     "pay": "npx ts-node scripts/pay.ts",
-    "mcp": "npx ts-node scripts/mcp-server.ts"
+    "mcp": "npx ts-node scripts/mcp-server.ts",
+    "sync-idl": "mkdir -p idl && cp target/idl/x402_scoring.json idl/x402_scoring.json && echo \"idl/x402_scoring.json updated\""
   },
   "keywords": [
     "solana",
@@ -35,6 +36,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "zod": "^4.5.4"
+    "zod": "^4.5.4",
+    "@coral-xyz/anchor": "^0.29",
+    "@solana/spl-token": "^0.3",
+    "@solana/web3.js": "^1.91",
+    "bs58": "^5.0.0"
   }
 }

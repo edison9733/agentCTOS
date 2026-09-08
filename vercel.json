@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm install --include=dev",
+  "buildCommand": "echo 'static site — the API functions are built by Vercel'",
+  "outputDirectory": "frontend",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "functions": {
+    "api/demo.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  }
+}

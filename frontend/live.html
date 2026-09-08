@@ -1,0 +1,343 @@
+<title>Live Settlement Run</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2064%2064%22%3E%3Crect%20width=%2264%22%20height=%2264%22%20fill=%22%2357453F%22/%3E%3Ccircle%20cx=%2232%22%20cy=%2232%22%20r=%2222.5%22%20fill=%22%23FFFFFF%22/%3E%3Cg%20fill=%22%2357453F%22%20transform=%22translate(32%2032)%22%3E%3Crect%20x=%22-2.75%22%20y=%22-14.5%22%20width=%225.5%22%20height=%2229%22%20rx=%220.5%22/%3E%3Crect%20x=%22-2.75%22%20y=%22-14.5%22%20width=%225.5%22%20height=%2229%22%20rx=%220.5%22%20transform=%22rotate(45)%22/%3E%3Crect%20x=%22-2.75%22%20y=%22-14.5%22%20width=%225.5%22%20height=%2229%22%20rx=%220.5%22%20transform=%22rotate(90)%22/%3E%3Crect%20x=%22-2.75%22%20y=%22-14.5%22%20width=%225.5%22%20height=%2229%22%20rx=%220.5%22%20transform=%22rotate(135)%22/%3E%3C/g%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap">
+
+<style>
+  /* Tokens lifted verbatim from index.html so the two pages are one site. */
+  :root {
+    --primary:#E48B59; --accent:#ED7B46; --bg:#FFFFFF; --surface:#53617A;
+    --text-1:#111827; --text-2:#4B5563; --border:#D8DADF;
+
+    --on-surface:#FFFFFF; --on-surface-2:rgba(255,255,255,0.72); --on-surface-3:rgba(255,255,255,0.45);
+    --surface-nested:rgba(255,255,255,0.08); --surface-line:rgba(255,255,255,0.16);
+
+    --good:#3F7D5C; --good-soft:#E8F1EC;
+    --critical:#C4482A; --critical-soft:#FBE9E2;
+    --accent-soft:#FDEDE4; --tint:#F7F8F9;
+
+    --f-sans:"Inter",ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --f-mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;
+
+    --gap:16px; --card-pad:24px; --section-pad:80px;
+    --r-card:16px; --r-control:8px; --r-pill:9999px;
+
+    --shadow:0 1px 2px rgba(17,24,39,0.04), 0 8px 24px -12px rgba(17,24,39,0.14);
+    --ease:cubic-bezier(0.22,0.61,0.36,1);
+  }
+
+  * { box-sizing:border-box; }
+
+  body {
+    margin:0; background:var(--bg); color:var(--text-1);
+    font-family:var(--f-sans); font-size:16px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .page {
+    max-width:1000px; margin:0 auto;
+    padding:clamp(24px,4vw,40px) clamp(20px,4vw,40px) var(--section-pad);
+    display:flex; flex-direction:column; gap:clamp(28px,4vw,40px);
+  }
+
+  .nav { display:flex; align-items:center; justify-content:space-between; gap:var(--gap); flex-wrap:wrap; }
+  .mark { display:flex; align-items:center; gap:10px; }
+  .glyph { width:28px; height:28px; border-radius:var(--r-control); flex:none; background:linear-gradient(140deg,var(--primary),var(--accent)); }
+  .mark span { font-family:var(--f-mono); font-size:12px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; }
+  .tabs { display:flex; gap:4px; }
+  .tabs a {
+    font-family:var(--f-mono); font-size:12px; font-weight:500; letter-spacing:0.06em; text-transform:uppercase;
+    padding:8px 14px; border-radius:var(--r-pill); text-decoration:none; color:var(--text-2);
+    transition:background-color 200ms var(--ease), color 200ms var(--ease);
+  }
+  .tabs a:hover { background:var(--tint); color:var(--text-1); }
+  .tabs a[aria-current="page"] { background:var(--text-1); color:#FFFFFF; }
+  .tabs a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  .head { display:flex; flex-direction:column; gap:10px; max-width:62ch; }
+  .eyebrow { font-family:var(--f-mono); font-size:12px; font-weight:600; line-height:1.2; letter-spacing:0.1em; text-transform:uppercase; color:var(--accent); }
+  h1 { margin:0; font-weight:500; font-size:clamp(30px,4.6vw,48px); line-height:1.04; text-wrap:balance; }
+  .head p { margin:0; color:var(--text-2); max-width:60ch; }
+
+  /* ---------- control bar ---------- */
+  .bar { display:flex; align-items:center; gap:var(--gap); flex-wrap:wrap;
+    border:1px solid var(--border); border-radius:var(--r-card); padding:16px var(--card-pad); background:var(--bg); box-shadow:var(--shadow); }
+  button.run {
+    font-family:var(--f-mono); font-size:12px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase;
+    padding:12px 22px; border-radius:var(--r-pill); border:0; cursor:pointer;
+    background:var(--text-1); color:#fff; transition:opacity 200ms var(--ease), transform 200ms var(--ease);
+  }
+  button.run:hover:not(:disabled) { transform:translateY(-1px); }
+  button.run:disabled { opacity:0.45; cursor:not-allowed; }
+  button.run:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .status { font-family:var(--f-mono); font-size:12px; color:var(--text-2); display:flex; align-items:center; gap:8px; }
+  .dot { width:8px; height:8px; border-radius:var(--r-pill); background:var(--border); flex:none; }
+  .dot.live { background:var(--accent); animation:pulse 1.4s var(--ease) infinite; }
+  .dot.done { background:var(--good); }
+  .dot.err  { background:var(--critical); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+  @media (prefers-reduced-motion:reduce) { .dot.live{animation:none} button.run:hover:not(:disabled){transform:none} }
+
+  /* ---------- acts ---------- */
+  .acts { display:flex; flex-direction:column; gap:var(--gap); }
+  .act { border:1px solid var(--border); border-radius:var(--r-card); padding:var(--card-pad);
+    display:flex; flex-direction:column; gap:12px; background:var(--bg); box-shadow:var(--shadow); }
+  .act.pending { opacity:0.5; box-shadow:none; }
+  .act.active { border-color:var(--accent); }
+  .act-top { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .act-no { font-family:var(--f-mono); font-size:12px; font-weight:600; letter-spacing:0.1em;
+    text-transform:uppercase; color:var(--accent); flex:none; }
+  .act-title { margin:0; font-size:18px; font-weight:600; line-height:1.3; text-wrap:balance; }
+  .act-claim { margin:0; color:var(--text-2); font-size:15px; }
+
+  .proof { display:flex; flex-direction:column; gap:8px; border-left:2px solid var(--accent);
+    padding:2px 0 2px 16px; }
+  .proof .p { margin:0; font-family:var(--f-mono); font-size:13px; line-height:1.65;
+    font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .proof .n { margin:0; font-size:14px; color:var(--text-2); }
+
+  .links { display:flex; flex-direction:column; gap:6px; }
+  .links a { font-family:var(--f-mono); font-size:12px; color:var(--text-2); text-decoration:none;
+    display:flex; gap:10px; align-items:baseline; overflow-wrap:anywhere; }
+  .links a:hover { color:var(--accent); }
+  .links a:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  .links .lab { color:var(--text-1); font-weight:500; flex:none; }
+
+  .countdown { font-family:var(--f-mono); font-size:13px; color:var(--critical);
+    background:var(--critical-soft); border-radius:var(--r-control); padding:10px 14px;
+    font-variant-numeric:tabular-nums; }
+  .err { font-family:var(--f-mono); font-size:13px; color:var(--critical);
+    background:var(--critical-soft); border-radius:var(--r-control); padding:12px 16px; }
+  .foot { font-size:14px; color:var(--text-2); border-top:1px solid var(--border); padding-top:20px; }
+  .foot code { font-family:var(--f-mono); font-size:13px; }
+</style>
+
+<div class="page">
+  <nav class="nav">
+    <div class="mark"><div class="glyph"></div><span>Agent CTOS</span></div>
+    <div class="tabs">
+      <a href="index.html#/network">Network</a>
+      <a href="index.html#/reports">Reports</a>
+      <a href="live.html" aria-current="page">Live</a>
+    </div>
+  </nav>
+
+  <header class="head">
+    <div class="eyebrow">Live on devnet</div>
+    <h1>Watch the escrow survive a rug, in real time</h1>
+    <p>
+      Five acts, each a real transaction on Solana devnet. Nothing here is simulated —
+      every figure is read back from the program's own on-chain accounts, and every
+      act links to the transaction on Solana Explorer so you can check it yourself.
+      You need no wallet: the run is driven server-side against a throwaway buyer
+      generated fresh for you.
+    </p>
+  </header>
+
+  <div class="bar">
+    <button class="run" id="run">Run the live demo</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Idle — about 90 seconds end to end</span></div>
+  </div>
+
+  <div class="acts" id="acts"></div>
+
+  <p class="foot">
+    Devnet only, with a valueless test token. The 60-second pause in act 4 is the
+    escrow's real timeout elapsing — the program will not allow <code>reclaim_timeout</code>
+    before it, which is exactly the guarantee being demonstrated.
+  </p>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var ACTS = [
+    { no: "Setup", title: "A fresh world, built on devnet" },
+    { no: "Act 1", title: "A merchant posts collateral; the buyer sets up a history" },
+    { no: "Act 2", title: "This buyer's first order is still fully escrowed" },
+    { no: "Act 3", title: "The same buyer's next order pays the merchant instantly" },
+    { no: "Act 4", title: "A second merchant posts collateral, takes an instant order, and vanishes" },
+    { no: "Act 5", title: "Surviving the rug: the reserve gets skimmed, the buyer is made whole" }
+  ];
+
+  var runBtn = document.getElementById("run");
+  var statusEl = document.getElementById("status");
+  var dotEl = document.getElementById("dot");
+  var actsEl = document.getElementById("acts");
+
+  function setStatus(text, state) {
+    statusEl.textContent = text;
+    dotEl.className = "dot" + (state ? " " + state : "");
+  }
+
+  /* Render the five placeholders up front, so the page shows its shape at rest
+     rather than an empty column that only means something once you press run. */
+  function scaffold() {
+    actsEl.textContent = "";
+    ACTS.forEach(function (a, i) {
+      var el = document.createElement("section");
+      el.className = "act pending";
+      el.id = "act-" + i;
+      var top = document.createElement("div");
+      top.className = "act-top";
+      var no = document.createElement("span");
+      no.className = "act-no";
+      no.textContent = a.no;
+      var h = document.createElement("h2");
+      h.className = "act-title";
+      h.textContent = a.title;
+      top.appendChild(no);
+      top.appendChild(h);
+      el.appendChild(top);
+      actsEl.appendChild(el);
+    });
+  }
+
+  function explorer(sig) {
+    return "https://explorer.solana.com/tx/" + sig + "?cluster=devnet";
+  }
+
+  function fill(i, data) {
+    var el = document.getElementById("act-" + i);
+    el.className = "act";
+    el.textContent = "";
+
+    var top = document.createElement("div");
+    top.className = "act-top";
+    var no = document.createElement("span");
+    no.className = "act-no";
+    no.textContent = ACTS[i].no;
+    var h = document.createElement("h2");
+    h.className = "act-title";
+    h.textContent = data.title || ACTS[i].title;
+    top.appendChild(no);
+    top.appendChild(h);
+    el.appendChild(top);
+
+    if (data.claim) {
+      var c = document.createElement("p");
+      c.className = "act-claim";
+      c.textContent = data.claim;
+      el.appendChild(c);
+    }
+
+    if (data.lines && data.lines.length) {
+      var box = document.createElement("div");
+      box.className = "proof";
+      data.lines.forEach(function (line) {
+        var p = document.createElement("p");
+        p.className = line.kind === "proof" ? "p" : "n";
+        p.textContent = line.text;
+        box.appendChild(p);
+      });
+      el.appendChild(box);
+    }
+
+    if (data.links && data.links.length) {
+      var links = document.createElement("div");
+      links.className = "links";
+      data.links.forEach(function (l) {
+        var a = document.createElement("a");
+        a.href = explorer(l.sig);
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        var lab = document.createElement("span");
+        lab.className = "lab";
+        lab.textContent = l.label;
+        var sig = document.createElement("span");
+        sig.textContent = l.sig.slice(0, 24) + "…";
+        a.appendChild(lab);
+        a.appendChild(sig);
+        links.appendChild(a);
+      });
+      el.appendChild(links);
+    }
+    return el;
+  }
+
+  function showError(i, message) {
+    var el = document.getElementById("act-" + i) || actsEl;
+    el.className = "act";
+    var e = document.createElement("p");
+    e.className = "err";
+    e.textContent = message;
+    el.appendChild(e);
+  }
+
+  async function callAct(act, session) {
+    var res = await fetch("/api/demo", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ act: act, session: session })
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+    return data;
+  }
+
+  /* Act 4 opens an escrow that cannot be reclaimed until it expires. The wait
+     is the point, so show it ticking rather than hiding it behind a spinner. */
+  function countdown(untilMs, hostEl) {
+    return new Promise(function (resolve) {
+      var box = document.createElement("div");
+      box.className = "countdown";
+      hostEl.appendChild(box);
+      (function tick() {
+        var left = Math.max(0, untilMs - Date.now());
+        var s = Math.ceil(left / 1000);
+        box.textContent =
+          "Escrow not yet expired — reclaim_timeout is rejected by the program for another " +
+          s + "s";
+        if (left <= 0) {
+          box.textContent = "Escrow expired. The buyer can now reclaim without the merchant.";
+          resolve();
+        } else {
+          setTimeout(tick, 250);
+        }
+      })();
+    });
+  }
+
+  async function run() {
+    runBtn.disabled = true;
+    scaffold();
+    var session = null;
+
+    try {
+      for (var i = 0; i <= 5; i++) {
+        setStatus(ACTS[i].no + " — sending transactions…", "live");
+        document.getElementById("act-" + i).className = "act active";
+
+        var data = await callAct(i, session);
+        session = data.session;
+        var el = fill(i, data);
+
+        if (data.waitUntil) {
+          setStatus("Act 4 — waiting out the escrow timeout…", "live");
+          await countdown(data.waitUntil, el);
+        }
+      }
+      setStatus("Complete — every figure above came from on-chain state", "done");
+    } catch (err) {
+      setStatus("Run failed", "err");
+      showError(
+        (function () {
+          for (var j = 0; j <= 5; j++) {
+            if (document.getElementById("act-" + j).className.indexOf("active") >= 0) return j;
+          }
+          return 0;
+        })(),
+        String(err.message || err)
+      );
+    } finally {
+      runBtn.disabled = false;
+      runBtn.textContent = "Run it again";
+    }
+  }
+
+  runBtn.addEventListener("click", run);
+  scaffold();
+})();
+</script>
