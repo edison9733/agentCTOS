@@ -193,8 +193,8 @@ pub mod x402_scoring {
 
         // -------- read the buyer's standing, if it has ever been opened.
         let established = if *ctx.accounts.buyer_standing.owner == crate::ID {
-            let standing: Account<BuyerStanding> =
-                Account::try_from(&ctx.accounts.buyer_standing)?;
+            let standing_info = ctx.accounts.buyer_standing.to_account_info();
+            let standing: Account<BuyerStanding> = Account::try_from(&standing_info)?;
             require!(standing.buyer == buyer_key, ErrorCode::InvalidStanding);
             standing.settled_count > 0
         } else {
@@ -204,8 +204,8 @@ pub mod x402_scoring {
         // -------- read the merchant's available reserve, if one is open.
         let (reserve_exists, available_reserve) =
             if *ctx.accounts.merchant_reserve.owner == crate::ID {
-                let reserve: Account<MerchantReserve> =
-                    Account::try_from(&ctx.accounts.merchant_reserve)?;
+                let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
+                let reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
                 require!(reserve.merchant == merchant_key, ErrorCode::InvalidReserve);
                 require!(reserve.mint == mint_key, ErrorCode::InvalidMint);
                 let expected_vault = Pubkey::create_program_address(
@@ -217,8 +217,8 @@ pub mod x402_scoring {
                     expected_vault == ctx.accounts.reserve_vault.key(),
                     ErrorCode::InvalidReserve
                 );
-                let vault: Account<TokenAccount> =
-                    Account::try_from(&ctx.accounts.reserve_vault)?;
+                let vault_info = ctx.accounts.reserve_vault.to_account_info();
+                let vault: Account<TokenAccount> = Account::try_from(&vault_info)?;
                 let available = vault.amount.saturating_sub(reserve.locked_exposure);
                 (true, available)
             } else {
@@ -252,8 +252,8 @@ pub mod x402_scoring {
             // can only be nonzero if available_reserve was read above, which
             // only happens when the reserve account actually exists.
             require!(reserve_exists, ErrorCode::InvalidReserve);
-            let mut reserve: Account<MerchantReserve> =
-                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
+            let mut reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
             reserve.locked_exposure = reserve
                 .locked_exposure
                 .checked_add(instant_amount)
@@ -324,8 +324,8 @@ pub mod x402_scoring {
             &ctx.accounts.treasury_token,
             &mut ctx.accounts.payment,
             ctx.accounts.buyer.to_account_info(),
-            &ctx.accounts.merchant_reserve,
-            &ctx.accounts.buyer_standing,
+            &ctx.accounts.merchant_reserve.to_account_info(),
+            &ctx.accounts.buyer_standing.to_account_info(),
             order_id,
         )
     }
@@ -398,8 +398,8 @@ pub mod x402_scoring {
             &ctx.accounts.treasury_token,
             &mut ctx.accounts.payment,
             ctx.accounts.merchant.to_account_info(),
-            &ctx.accounts.merchant_reserve,
-            &ctx.accounts.buyer_standing,
+            &ctx.accounts.merchant_reserve.to_account_info(),
+            &ctx.accounts.buyer_standing.to_account_info(),
             order_id,
         )
     }
@@ -440,10 +440,11 @@ pub mod x402_scoring {
                 *ctx.accounts.merchant_reserve.owner == crate::ID,
                 ErrorCode::InvalidReserve
             );
-            let mut reserve: Account<MerchantReserve> =
-                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            let reserve_info = ctx.accounts.merchant_reserve.to_account_info();
+            let mut reserve: Account<MerchantReserve> = Account::try_from(&reserve_info)?;
             require!(reserve.merchant == merchant, ErrorCode::InvalidReserve);
-            let vault: Account<TokenAccount> = Account::try_from(&ctx.accounts.reserve_vault)?;
+            let vault_info = ctx.accounts.reserve_vault.to_account_info();
+            let vault: Account<TokenAccount> = Account::try_from(&vault_info)?;
             require!(vault.owner == ctx.accounts.merchant_reserve.key(), ErrorCode::InvalidReserve);
 
             // Made whole up to whatever the reserve actually still holds —
@@ -514,8 +515,8 @@ fn settle_fulfilled<'info>(
     treasury_token: &Account<'info, TokenAccount>,
     payment: &mut Account<'info, Payment>,
     rent_destination: AccountInfo<'info>,
-    merchant_reserve: &UncheckedAccount<'info>,
-    buyer_standing: &UncheckedAccount<'info>,
+    merchant_reserve: &AccountInfo<'info>,
+    buyer_standing: &AccountInfo<'info>,
     order_id: u64,
 ) -> Result<()> {
     let escrowed_amount = payment.escrowed_amount;
