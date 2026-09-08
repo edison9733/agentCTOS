@@ -332,7 +332,7 @@ describe("x402 escrow — routed by collateral", () => {
   });
 
   it("withdraw_reserve is rejected past the currently-available (unlocked) balance", async () => {
-    const { owner } = await newMerchant(unit(50));
+    const { owner, token } = await newMerchant(unit(50));
     const { keypair: buyer, token: buyerToken } = await fundedBuyer(unit(200));
     await registerBuyer(buyer);
     const first = await newMerchant();
@@ -353,7 +353,7 @@ describe("x402 escrow — routed by collateral", () => {
       .rpc();
 
     // Lock 40 of the merchant's 50 reserve into an outstanding instant order.
-    await pay(buyer, buyerToken, owner.publicKey, (await newMerchant()).token, unit(40), new BN(131));
+    await pay(buyer, buyerToken, owner.publicKey, token, unit(40), new BN(131));
 
     const withdrawDest = await createAccount(provider.connection, payerWallet, mint, owner.publicKey, Keypair.generate());
     try {
