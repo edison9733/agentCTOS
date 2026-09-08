@@ -184,7 +184,10 @@ function explorer(kind: "tx" | "address", id: string, rpcUrl: string): string {
   return base;
 }
 
-const step = (n: number, title: string) => console.log(`\n[${n}] ${title}`);
+/* Numbered as they run, not by hand: --reserve and --register are optional,
+   and hardcoded numbers made the output skip [2] whenever they were absent. */
+let stepNo = 0;
+const step = (title: string) => console.log(`\n[${++stepNo}] ${title}`);
 const kv = (label: string, value: string) => console.log(`      ${label.padEnd(20)} ${value}`);
 
 async function main() {
@@ -272,11 +275,11 @@ async function main() {
   let merchantKey: Keypair | null = null;
 
   if (merchantArg) {
-    step(1, "Paying an existing merchant");
+    step("Paying an existing merchant");
     mint = new PublicKey(mintArg!);
     merchant = new PublicKey(merchantArg);
   } else {
-    step(1, "Minting a demo token and generating a merchant");
+    step("Minting a demo token and generating a merchant");
     mint = await createMint(provider.connection, buyer, provider.wallet.publicKey, null, DECIMALS);
     merchantKey = Keypair.generate();
     merchant = merchantKey.publicKey;
@@ -318,7 +321,7 @@ async function main() {
   const reserveVault = reserveVaultPda(reserve);
 
   if (reserveAmount !== undefined && merchantKey) {
-    step(2, `Merchant posts ${reserveAmount.toFixed(3)} tokens of collateral`);
+    step(`Merchant posts ${reserveAmount.toFixed(3)} tokens of collateral`);
     await program.methods
       .openReserve()
       .accounts({
@@ -356,7 +359,7 @@ async function main() {
   }
 
   // -------------------------------------------------------------- payment
-  step(3, `initiate_payment — ${amount.toFixed(3)} tokens, routed by reserve + standing`);
+  step(`initiate_payment — ${amount.toFixed(3)} tokens, routed by reserve + standing`);
   const orderId = new BN(Date.now() % 1_000_000_000);
   const payment = paymentPda(merchant, orderId);
   const vault = vaultPda(payment);
@@ -391,7 +394,7 @@ async function main() {
   kv("tx", explorer("tx", paySig, rpcUrl));
 
   if (settle === "hold") {
-    step(4, "Leaving the escrow open (--settle hold)");
+    step("Leaving the escrow open (--settle hold)");
     kv("payment", explorer("address", payment.toBase58(), rpcUrl));
     return;
   }
@@ -399,7 +402,7 @@ async function main() {
   // ----------------------------------------------------------- settlement
   let sig: string;
   if (settle === "confirm") {
-    step(4, "confirm_delivery — buyer releases the escrow");
+    step("confirm_delivery — buyer releases the escrow");
     sig = await program.methods
       .confirmDelivery(orderId)
       .accounts({
@@ -418,17 +421,24 @@ async function main() {
     if (!merchantKey) {
       throw new Error("--settle claim needs a generated merchant: this script must hold its keypair to sign the claim");
     }
-    step(4, "claim_fulfillment — merchant claims delivery without the buyer confirming");
+    step("claim_fulfillment — merchant claims delivery without the buyer confirming");
     sig = await program.methods
       .claimFulfillment(orderId)
       .accounts({ payment, merchant })
       .signers([merchantKey])
       .rpc();
-    kv("note", "finalize_claim becomes callable 24h from now, by anyone, if undisputed");
+    const disputeEnds = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+    kv("tx", explorer("tx", sig, rpcUrl));
+    kv("payment", explorer("address", payment.toBase58(), rpcUrl));
+    kv("escrow", "still held — the claim starts a dispute window, it does not release funds");
+    kv("disputed by", `${new Date(p.expiry.toNumber() * 1000).toISOString()} (buyer can still reclaim at expiry)`);
+    kv("finalize after", `${disputeEnds} — callable by anyone if undisputed`);
+    /* Returns early on purpose: the order stays open, so there is no
+       settlement summary to print and no rent to reclaim yet. */
     return;
   } else {
     const waitMs = Math.max(0, p.expiry.toNumber() * 1000 - Date.now()) + 2_000;
-    step(4, `Waiting ${Math.ceil(waitMs / 1000)}s for expiry, then reclaiming`);
+    step(`Waiting ${Math.ceil(waitMs / 1000)}s for expiry, then reclaiming`);
     await new Promise((r) => setTimeout(r, waitMs));
     sig = await program.methods
       .reclaimTimeout(orderId)
@@ -452,7 +462,7 @@ async function main() {
   kv("buyer balance", fmt((await getAccount(provider.connection, buyerToken)).amount));
   kv("tx", explorer("tx", sig, rpcUrl));
 
-  step(5, "close_payment — reclaim the order record's rent");
+  step("close_payment — reclaim the order record's rent");
   const closeSig = await program.methods
     .closePayment(orderId)
     .accounts({ payment, buyer: buyer.publicKey })
