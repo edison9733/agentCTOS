@@ -32,11 +32,11 @@ import { BN, Program } from "@coral-xyz/anchor";
 import { PublicKey, Keypair, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
-  createMint,
-  createAccount,
-  mintTo,
+  createMint as rawCreateMint,
+  createAccount as rawCreateAccount,
+  mintTo as rawMintTo,
   getAccount,
-  getOrCreateAssociatedTokenAccount,
+  getOrCreateAssociatedTokenAccount as rawGetOrCreateAta,
 } from "@solana/spl-token";
 import * as fs from "fs";
 import * as path from "path";
@@ -56,6 +56,85 @@ function loadProgram(provider: anchor.AnchorProvider): Program<X402Scoring> {
   ).publicKey;
   return new anchor.Program(idl, programId, provider) as Program<X402Scoring>;
 }
+
+/**
+ * Transient RPC failures — a blockhash the receiving node hasn't caught up to
+ * (load-balanced providers route the fetch and the send to different backends),
+ * rate limits, socket timeouts. All clear on a retry, because a retry fetches a
+ * fresh blockhash. A real program error is deliberately not in this list: it is
+ * rethrown at once so genuine bugs fail loudly instead of being retried away.
+ */
+const TRANSIENT =
+  /blockhash not found|block height exceeded|blockhash expired|429|too many requests|timed out|timeout|socket hang up|fetch failed|econnreset|node is behind|failed to get/i;
+
+/**
+ * web3.js caches the blockhash for 30s and `connection.sendTransaction` — the
+ * path the spl-token helpers take — reads that cache. The whole backoff
+ * schedule below fits inside 30s, so without this a retry would replay the
+ * exact blockhash that just failed. Dropping the cache forces a fresh one.
+ */
+function freshenBlockhash(conn: any) {
+  if (conn && conn._blockhashInfo) {
+    conn._blockhashInfo = {
+      latestBlockhash: null,
+      lastFetch: 0,
+      transactionSignatures: [],
+      simulatedSignatures: [],
+    };
+  }
+}
+
+async function rpc<T>(
+  label: string,
+  fn: () => Promise<T>,
+  conn?: any,
+  attempts = 6
+): Promise<T> {
+  let lastErr: any;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      const msg = `${e?.message ?? e} ${e?.transactionMessage ?? ""}`;
+      if (!TRANSIENT.test(msg) || i === attempts) throw e;
+      const backoff = Math.min(500 * 2 ** (i - 1), 8_000);
+      console.log(`      (${label}: transient RPC error, retrying in ${backoff}ms)`);
+      freshenBlockhash(conn);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr;
+}
+
+/** A breath between sends, so a burst of transactions doesn't earn a 429. */
+const pace = () => new Promise((r) => setTimeout(r, 300));
+
+// The spl-token helpers send through their own sendAndConfirmTransaction, so
+// the provider-level wrapper never sees them — give each its own retry here.
+// getAccount needs none: it reads via connection.getAccountInfo, wrapped below.
+// args[0] is always the Connection, which `rpc` needs so it can drop the stale
+// blockhash between attempts.
+const createMint: typeof rawCreateMint = async (...args) => {
+  const r = await rpc("createMint", () => rawCreateMint(...args), args[0]);
+  await pace();
+  return r;
+};
+const createAccount: typeof rawCreateAccount = async (...args) => {
+  const r = await rpc("createAccount", () => rawCreateAccount(...args), args[0]);
+  await pace();
+  return r;
+};
+const mintTo: typeof rawMintTo = async (...args) => {
+  const r = await rpc("mintTo", () => rawMintTo(...args), args[0]);
+  await pace();
+  return r;
+};
+const getOrCreateAssociatedTokenAccount: typeof rawGetOrCreateAta = async (...args) => {
+  const r = await rpc("getOrCreateAta", () => rawGetOrCreateAta(...args), args[0]);
+  await pace();
+  return r;
+};
 
 const TREASURY = new PublicKey("5i7zzV9hQUCbpg8MXSNJB3QQkL6zscDd8VQKow46vg7E");
 
@@ -117,6 +196,22 @@ async function main() {
     commitment: "confirmed",
     preflightCommitment: "confirmed",
   });
+
+  // Every Anchor `.rpc()` here funnels through provider.sendAndConfirm, and
+  // every account read through connection.getAccountInfo. Wrapping the two
+  // chokepoints covers them all. Retrying a send is safe because Anchor
+  // re-fetches the blockhash and re-signs on each attempt — exactly the cure
+  // for "Blockhash not found".
+  const sendAndConfirm = provider.sendAndConfirm.bind(provider);
+  (provider as any).sendAndConfirm = async (tx: any, signers?: any, opts?: any) => {
+    const sig = await rpc("tx", () => sendAndConfirm(tx, signers, opts), connection);
+    await pace();
+    return sig;
+  };
+  const getAccountInfo = connection.getAccountInfo.bind(connection);
+  (connection as any).getAccountInfo = (pubkey: any, cfg?: any) =>
+    rpc("getAccountInfo", () => getAccountInfo(pubkey, cfg), connection);
+
   anchor.setProvider(provider);
 
   const program = loadProgram(provider);
