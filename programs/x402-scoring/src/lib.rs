@@ -70,7 +70,9 @@ const CLAIM_DISPUTE_SECONDS: i64 = 24 * 60 * 60; // 24 hours
 /// what that attack can ever extract. See README "Pricing the patient
 /// attacker" for the worked number — publishing it, rather than leaving it
 /// undiscovered, is the point of naming these constants at all.
+#[allow(dead_code)]
 const LIMIT_COEFFICIENT_K: u64 = 100;
+#[allow(dead_code)]
 const RESERVE_SKIM_RATE_C: u64 = 5;
 
 #[program]
