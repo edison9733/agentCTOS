@@ -193,8 +193,7 @@ pub mod x402_scoring {
 
         // -------- read the buyer's standing, if it has ever been opened.
         let established = if *ctx.accounts.buyer_standing.owner == crate::ID {
-            let standing: Account<BuyerStanding> =
-                Account::try_from(&ctx.accounts.buyer_standing)?;
+            let standing: BuyerStanding = read_account(&ctx.accounts.buyer_standing)?;
             require!(standing.buyer == buyer_key, ErrorCode::InvalidStanding);
             standing.settled_count > 0
         } else {
@@ -204,8 +203,7 @@ pub mod x402_scoring {
         // -------- read the merchant's available reserve, if one is open.
         let (reserve_exists, available_reserve) =
             if *ctx.accounts.merchant_reserve.owner == crate::ID {
-                let reserve: Account<MerchantReserve> =
-                    Account::try_from(&ctx.accounts.merchant_reserve)?;
+                let reserve: MerchantReserve = read_account(&ctx.accounts.merchant_reserve)?;
                 require!(reserve.merchant == merchant_key, ErrorCode::InvalidReserve);
                 require!(reserve.mint == mint_key, ErrorCode::InvalidMint);
                 let expected_vault = Pubkey::create_program_address(
@@ -217,8 +215,7 @@ pub mod x402_scoring {
                     expected_vault == ctx.accounts.reserve_vault.key(),
                     ErrorCode::InvalidReserve
                 );
-                let vault: Account<TokenAccount> =
-                    Account::try_from(&ctx.accounts.reserve_vault)?;
+                let vault: TokenAccount = read_account(&ctx.accounts.reserve_vault)?;
                 let available = vault.amount.saturating_sub(reserve.locked_exposure);
                 (true, available)
             } else {
@@ -252,13 +249,12 @@ pub mod x402_scoring {
             // can only be nonzero if available_reserve was read above, which
             // only happens when the reserve account actually exists.
             require!(reserve_exists, ErrorCode::InvalidReserve);
-            let mut reserve: Account<MerchantReserve> =
-                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            let mut reserve: MerchantReserve = read_account(&ctx.accounts.merchant_reserve)?;
             reserve.locked_exposure = reserve
                 .locked_exposure
                 .checked_add(instant_amount)
                 .ok_or(ErrorCode::ArithmeticOverflow)?;
-            reserve.exit(ctx.program_id)?;
+            write_account(&ctx.accounts.merchant_reserve, &reserve)?;
         }
 
         if escrowed_amount > 0 {
@@ -440,10 +436,9 @@ pub mod x402_scoring {
                 *ctx.accounts.merchant_reserve.owner == crate::ID,
                 ErrorCode::InvalidReserve
             );
-            let mut reserve: Account<MerchantReserve> =
-                Account::try_from(&ctx.accounts.merchant_reserve)?;
+            let mut reserve: MerchantReserve = read_account(&ctx.accounts.merchant_reserve)?;
             require!(reserve.merchant == merchant, ErrorCode::InvalidReserve);
-            let vault: Account<TokenAccount> = Account::try_from(&ctx.accounts.reserve_vault)?;
+            let vault: TokenAccount = read_account(&ctx.accounts.reserve_vault)?;
             require!(vault.owner == ctx.accounts.merchant_reserve.key(), ErrorCode::InvalidReserve);
 
             // Made whole up to whatever the reserve actually still holds —
@@ -467,7 +462,7 @@ pub mod x402_scoring {
                 )?;
             }
             reserve.locked_exposure = reserve.locked_exposure.saturating_sub(instant_amount);
-            reserve.exit(ctx.program_id)?;
+            write_account(&ctx.accounts.merchant_reserve, &reserve)?;
 
             emit!(ReserveSkimmed {
                 merchant,
@@ -500,6 +495,27 @@ pub mod x402_scoring {
         require!(payment.order_id == order_id, ErrorCode::InvalidOrder);
         Ok(())
     }
+}
+
+/// Reads one of this program's own accounts straight off its raw bytes,
+/// deliberately bypassing `Account::try_from`. `try_from` returns an
+/// `Account<'info, T>`, which requires the reference passed to it to itself
+/// live as long as that same `'info` — a bound nothing borrowed out of a
+/// `Context` inside a handler body can ever actually satisfy, since `ctx`
+/// only lives for the handler's own call. Deserializing straight into a
+/// plain, lifetime-free `T` sidesteps the requirement instead of fighting it.
+fn read_account<T: AccountDeserialize>(info: &AccountInfo) -> Result<T> {
+    let data = info.try_borrow_data()?;
+    T::try_deserialize(&mut &data[..])
+}
+
+/// The write-back half of `read_account`: re-serializes in place over the
+/// account's existing bytes. Only ever used on accounts whose size never
+/// changes after `init`, so there is no reallocation to handle.
+fn write_account<T: AccountSerialize>(info: &AccountInfo, account: &T) -> Result<()> {
+    let mut data = info.try_borrow_mut_data()?;
+    let mut cursor = std::io::Cursor::new(&mut data[..]);
+    account.try_serialize(&mut cursor)
 }
 
 /// Shared by `confirm_delivery` and `finalize_claim`: release the escrowed
@@ -537,18 +553,18 @@ fn settle_fulfilled<'info>(
     )?;
 
     if instant_amount > 0 && *merchant_reserve.owner == crate::ID {
-        let mut reserve: Account<MerchantReserve> = Account::try_from(merchant_reserve)?;
+        let mut reserve: MerchantReserve = read_account(merchant_reserve)?;
         if reserve.merchant == payment.merchant {
             reserve.locked_exposure = reserve.locked_exposure.saturating_sub(instant_amount);
-            reserve.exit(&crate::ID)?;
+            write_account(merchant_reserve, &reserve)?;
         }
     }
 
     if *buyer_standing.owner == crate::ID {
-        let mut standing: Account<BuyerStanding> = Account::try_from(buyer_standing)?;
+        let mut standing: BuyerStanding = read_account(buyer_standing)?;
         if standing.buyer == payment.buyer {
             standing.settled_count = standing.settled_count.saturating_add(1);
-            standing.exit(&crate::ID)?;
+            write_account(buyer_standing, &standing)?;
         }
     }
 
