@@ -10,7 +10,8 @@
     "demo": "npx ts-node scripts/demo.ts",
     "pay": "npx ts-node scripts/pay.ts",
     "mcp": "npx ts-node scripts/mcp-server.ts",
-    "sync-idl": "mkdir -p idl && cp target/idl/x402_scoring.json idl/x402_scoring.json && echo \"idl/x402_scoring.json updated\""
+    "sync-idl": "mkdir -p idl && cp target/idl/x402_scoring.json idl/x402_scoring.json && echo \"idl/x402_scoring.json updated\"",
+    "export-deck": "node scripts/export-deck.js"
   },
   "keywords": [
     "solana",
