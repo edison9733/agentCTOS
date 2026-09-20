@@ -1,0 +1,36 @@
+{
+  "note": "Public addresses only. Secret keys live in .demo-wallets/ and are gitignored.",
+  "cluster": "devnet",
+  "program": "HwyguqZ5QVJ5AWZQbeKZ6Cv4hCSowzDk7L9ujAC9zKz4",
+  "mint": "5KMwif3EXCXPpGUnT9ctdhnyDf1Z5niqgf4fvb4MpAWT",
+  "decimals": 6,
+  "merchants": [
+    {
+      "id": "serpwire",
+      "name": "serpwire.api",
+      "blurb": "Live web search for agents. 60 calls, 410ms median.",
+      "price": 12.4,
+      "reserve": 500,
+      "profile": "fully collateralized",
+      "pubkey": "85fmDQZCqBUX9GTDCkEKo9X2Xrt5PD9dHbCbpN1njpcJ"
+    },
+    {
+      "id": "tilecache",
+      "name": "tilecache.io",
+      "blurb": "Vector map tiles by bounding box. Cached, billed per 1k.",
+      "price": 40,
+      "reserve": 15,
+      "profile": "partly collateralized",
+      "pubkey": "3PaND36iU83xqGMQhgfywedP253qDR8yHhmXcfvWKrZ5"
+    },
+    {
+      "id": "lumen",
+      "name": "lumen.render",
+      "blurb": "Image generation, 1024px, queued.",
+      "price": 8,
+      "reserve": 0,
+      "profile": "uncollateralized",
+      "pubkey": "hARU1B2aacUL937Wo3b21CLtC3x4DjNvbrM3NYiD5MZ"
+    }
+  ]
+}

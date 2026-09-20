@@ -20,3 +20,9 @@ dist/
 *.zip
 demo.cast
 demo.gif
+
+# Private keys for the persistent demo merchants. Devnet play money only, but
+# a committed secret key is a committed secret key. The public addresses live
+# in frontend/merchants.json, which is safe to commit and is what the site reads.
+.demo-wallets/
+demo-wallet.json
